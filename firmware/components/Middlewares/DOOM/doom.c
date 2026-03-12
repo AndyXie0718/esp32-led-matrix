@@ -5,6 +5,8 @@
 
 #include <math.h>
 
+#include <string.h>
+
 #define PI_F 3.14159265358979323846f
 
 static inline int iclamp(int x, int lo, int hi) {
