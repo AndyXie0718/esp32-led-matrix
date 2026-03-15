@@ -205,8 +205,14 @@ esp_err_t gravity_sensor_start(void) {
 
     ESP_LOGI(TAG, "mpu6050 started (I2C %d, SDA=%d SCL=%d)", I2C_MASTER_NUM, I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO);
 
-    BaseType_t ok = xTaskCreatePinnedToCore(gravity_sensor_task, "gravity_task", 4096, NULL, 6, &s_sensor_task, 0);
+    BaseType_t ok = pdFAIL;
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+    ok = xTaskCreatePinnedToCore(gravity_sensor_task, "gravity_task", 4096, NULL, 6, &s_sensor_task, 0);
+#else
+    ok = xTaskCreate(gravity_sensor_task, "gravity_task", 4096, NULL, 6, &s_sensor_task);
+#endif
     if (ok != pdPASS) {
+        ESP_LOGE(TAG, "gravity task create failed");
         s_sensor_task = NULL;
         return ESP_FAIL;
     }

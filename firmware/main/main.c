@@ -8,7 +8,8 @@
 #include "sim_manager.h"
 
 static const char* TAG = "app_main";
-static const sim_mode_t g_boot_mode = SIM_MODE_FIRE;
+// static const sim_mode_t g_boot_mode = SIM_MODE_FIRE;     // 火焰模式
+static const sim_mode_t g_boot_mode = SIM_MODE_WATER;       // 流水模式
 
 #define MODE_KEY_PIN GPIO_NUM_0
 #define MODE_KEY_ACTIVE_LOW 1
@@ -62,7 +63,11 @@ void app_main(void) {
     }
 
     sim_runtime_config_t cfg = {
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
         .core_id = 1,
+#else
+        .core_id = 0,
+#endif
         .stack_size = 8192,
         .priority = 5,
         .stop_timeout_ms = 1000,
@@ -80,7 +85,12 @@ void app_main(void) {
         return;
     }
 
-    BaseType_t ok = xTaskCreatePinnedToCore(mode_switch_task, "mode_switch", 3072, NULL, 4, NULL, 0);
+    BaseType_t ok = pdFAIL;
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+    ok = xTaskCreatePinnedToCore(mode_switch_task, "mode_switch", 3072, NULL, 4, NULL, 0);
+#else
+    ok = xTaskCreate(mode_switch_task, "mode_switch", 3072, NULL, 4, NULL);
+#endif
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "mode switch task create failed");
     }

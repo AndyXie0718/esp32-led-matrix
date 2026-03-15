@@ -167,6 +167,15 @@ esp_err_t mpu6050_gravity_start(void)
     ESP_LOGI(TAG, "mpu6050 started (I2C %d, SDA=%d SCL=%d)",
              I2C_MASTER_NUM, I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO);
 
-    xTaskCreatePinnedToCore(mpu_task, "mpu6050_task", 4096, NULL, 6, NULL, 0);
+    BaseType_t ok = pdFAIL;
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+    ok = xTaskCreatePinnedToCore(mpu_task, "mpu6050_task", 4096, NULL, 6, NULL, 0);
+#else
+    ok = xTaskCreate(mpu_task, "mpu6050_task", 4096, NULL, 6, NULL);
+#endif
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "mpu task create failed");
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }

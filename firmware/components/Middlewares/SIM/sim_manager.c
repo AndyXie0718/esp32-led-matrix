@@ -9,7 +9,11 @@
 static const char* TAG = "sim_manager";
 
 static sim_runtime_config_t s_cfg = {
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
     .core_id = 1,
+#else
+    .core_id = 0,
+#endif
     .stack_size = 8192,
     .priority = 5,
     .stop_timeout_ms = 1000,

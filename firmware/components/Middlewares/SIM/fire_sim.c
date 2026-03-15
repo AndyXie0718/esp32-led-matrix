@@ -219,8 +219,19 @@ esp_err_t fire_sim_start(int core_id, uint32_t stack_size, int priority) {
     }
 
     s_running = true;
-    BaseType_t ok = xTaskCreatePinnedToCore(sim_task, "fire_sim", stack_size, NULL, priority, &s_task, core_id);
+    BaseType_t ok = pdFAIL;
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+    int target_core = core_id;
+    if (target_core < 0 || target_core >= CONFIG_FREERTOS_NUMBER_OF_CORES) {
+        target_core = tskNO_AFFINITY;
+    }
+    ok = xTaskCreatePinnedToCore(sim_task, "fire_sim", stack_size, NULL, priority, &s_task, target_core);
+#else
+    (void)core_id;
+    ok = xTaskCreate(sim_task, "fire_sim", stack_size, NULL, priority, &s_task);
+#endif
     if (ok != pdPASS) {
+        ESP_LOGE(TAG, "fire sim task create failed");
         s_running = false;
         s_task = NULL;
         return ESP_FAIL;
