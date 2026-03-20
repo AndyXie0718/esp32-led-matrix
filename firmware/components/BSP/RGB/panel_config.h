@@ -1,8 +1,10 @@
 #ifndef PANEL_CONFIG_H
 #define PANEL_CONFIG_H
 
-#define PANEL_WIDTH 16
-#define PANEL_HEIGHT 16
+// #define PANEL_WIDTH 16
+// #define PANEL_HEIGHT 16
+#define PANEL_WIDTH 8
+#define PANEL_HEIGHT 8
 #define PANEL_LED_COUNT (PANEL_WIDTH * PANEL_HEIGHT)
 
 // Column-major straight wiring: each column advances in +y order.

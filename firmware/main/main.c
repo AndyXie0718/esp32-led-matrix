@@ -6,6 +6,7 @@
 #include "freertos/task.h"
 #include "gravity.h"
 #include "sim_manager.h"
+#include "web_control.h"
 
 static const char* TAG = "app_main";
 // static const sim_mode_t g_boot_mode = SIM_MODE_FIRE;     // 火焰模式
@@ -35,7 +36,12 @@ static void mode_switch_task(void* arg) {
                 press_tick = now;
             } else if (!switched && (now - press_tick) >= pdMS_TO_TICKS(MODE_SWITCH_LONG_PRESS_MS)) {
                 sim_mode_t cur = sim_manager_current();
-                sim_mode_t next = (cur == SIM_MODE_FIRE) ? SIM_MODE_WATER : SIM_MODE_FIRE;
+                sim_mode_t next = SIM_MODE_WATER;
+                if (cur == SIM_MODE_WATER) {
+                    next = SIM_MODE_FIRE;
+                } else if (cur == SIM_MODE_FIRE) {
+                    next = SIM_MODE_CUSTOM;
+                }
                 esp_err_t err = sim_manager_switch(next);
                 if (err == ESP_OK) {
                     ESP_LOGI(TAG, "mode switched: %d -> %d", (int)cur, (int)next);
@@ -83,6 +89,11 @@ void app_main(void) {
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "sim_manager_start failed: %s", esp_err_to_name(err));
         return;
+    }
+
+    err = web_control_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "web_control_start failed: %s", esp_err_to_name(err));
     }
 
     BaseType_t ok = pdFAIL;

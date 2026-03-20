@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 
+#include "custom_sim.h"
 #include "esp_log.h"
 #include "fire_sim.h"
 #include "water_sim.h"
@@ -29,6 +30,9 @@ static esp_err_t start_mode(sim_mode_t mode) {
     if (mode == SIM_MODE_FIRE) {
         return fire_sim_start(s_cfg.core_id, s_cfg.stack_size, s_cfg.priority);
     }
+    if (mode == SIM_MODE_CUSTOM) {
+        return custom_sim_start(s_cfg.core_id, s_cfg.stack_size, s_cfg.priority);
+    }
     return ESP_ERR_INVALID_ARG;
 }
 
@@ -38,6 +42,9 @@ static esp_err_t stop_mode(sim_mode_t mode) {
     }
     if (mode == SIM_MODE_FIRE) {
         return fire_sim_stop(s_cfg.stop_timeout_ms);
+    }
+    if (mode == SIM_MODE_CUSTOM) {
+        return custom_sim_stop(s_cfg.stop_timeout_ms);
     }
     return ESP_OK;
 }

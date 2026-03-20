@@ -12,6 +12,7 @@ typedef enum {
     SIM_MODE_NONE = -1,
     SIM_MODE_WATER = 0,
     SIM_MODE_FIRE = 1,
+    SIM_MODE_CUSTOM = 2,
 } sim_mode_t;
 
 typedef struct {
