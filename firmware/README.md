@@ -189,3 +189,11 @@ rgb_show()
 # 4. 注意事项
 
 - 掉帧优先降 FPS 或减迭代次数
+
+
+## 开启AP-STA
+menuconfig: 
+- [ ] CONFIG_LWIP_IPV4=y
+- [ ] CONFIG_LWIP_IPV4_NAPT=y
+- [ ] CONFIG_LWIP_IPV4_NAPT_PORTMAP=y
+- [ ] CONFIG_LWIP_IP_FORWARD=y

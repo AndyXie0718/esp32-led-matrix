@@ -4,6 +4,7 @@ idf_component_register(
         "web_control.c"
     INCLUDE_DIRS "."
     REQUIRES
+        BSP
         Middlewares
         nvs_flash
         esp_event

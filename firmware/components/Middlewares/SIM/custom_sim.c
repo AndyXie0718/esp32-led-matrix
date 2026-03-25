@@ -13,7 +13,6 @@
 #define H PANEL_HEIGHT
 #define LED_COUNT PANEL_LED_COUNT
 
-#define CUSTOM_ON_VALUE PANEL_LED_VALUE_MAX
 #define CUSTOM_FPS 20
 
 #define GX_SIGN -1
@@ -46,8 +45,11 @@ static void draw_bitmap_locked(void) {
                     idx = panel_led_index(x, y);
             }
             // int idx = panel_led_index(W-1-x, y);
-            uint8_t on = s_bitmap[y * W + x] ? CUSTOM_ON_VALUE : 0;
-            rgb_set_fast((uint32_t)idx, on, on, on);
+            if (s_bitmap[y * W + x]) {
+                rgb_set_fast((uint32_t)idx, 255, 255, 255);
+            } else {
+                rgb_set_fast((uint32_t)idx, 0, 0, 0);
+            }
         }
     }
     rgb_show();
@@ -167,4 +169,21 @@ esp_err_t custom_sim_set_bitmap(const uint8_t* bitmap, size_t len) {
 
     xSemaphoreGive(s_lock);
     return ESP_OK;
+}
+
+esp_err_t custom_sim_set_color8(uint8_t r8, uint8_t g8, uint8_t b8) {
+    rgb_set_global_color8(r8, g8, b8);
+
+    if (s_running) {
+        if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE) {
+            return ESP_ERR_TIMEOUT;
+        }
+        draw_bitmap_locked();
+        xSemaphoreGive(s_lock);
+    }
+    return ESP_OK;
+}
+
+void custom_sim_get_color8(uint8_t* r8, uint8_t* g8, uint8_t* b8) {
+    rgb_get_global_color8(r8, g8, b8);
 }
