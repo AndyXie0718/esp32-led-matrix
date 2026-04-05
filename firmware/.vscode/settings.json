@@ -1,11 +1,12 @@
 {
-    "idf.currentSetup": "C:/Tools/Espressif/frameworks/esp-idf-v5.5.3/",
-    "idf.flashType": "UART",
+    "idf.currentSetup": "D:\\Tools\\.espressif\\v5.5.3\\esp-idf",
     "idf.customExtraVars": {
-        "IDF_TARGET": "esp32c3"
+        "IDF_TARGET": "esp32c3",
+        "OPENOCD_USB_ADAPTER_LOCATION": "2-4"
     },
     "idf.openOcdConfigs": [
         "board/esp32c3-builtin.cfg"
     ],
-    "idf.portWin": "COM9"
+    "idf.flashType": "UART",
+    "idf.portWin": "COM23"
 }

@@ -25,8 +25,8 @@ static TaskHandle_t s_sensor_task = NULL;
 #define GX_SIGN (-1.0f)
 #define GY_SIGN (1.0f)
 
-#define I2C_MASTER_SCL_IO 4
-#define I2C_MASTER_SDA_IO 3
+#define I2C_MASTER_SCL_IO 9
+#define I2C_MASTER_SDA_IO 10
 #define I2C_MASTER_NUM I2C_NUM_0
 #define I2C_MASTER_FREQ_HZ 400000
 

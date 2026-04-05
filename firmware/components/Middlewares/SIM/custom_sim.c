@@ -3,6 +3,7 @@
 #include <stdbool.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -13,7 +14,7 @@
 #define H PANEL_HEIGHT
 #define LED_COUNT PANEL_LED_COUNT
 
-#define CUSTOM_FPS 20
+#define CUSTOM_FPS 90
 
 #define GX_SIGN -1
 #define GY_SIGN 1
@@ -64,13 +65,29 @@ static void sim_task(void* arg) {
 
     TickType_t last_wake = xTaskGetTickCount();
     const TickType_t frame_ticks = pdMS_TO_TICKS(1000 / CUSTOM_FPS);
+    uint32_t fps_frames = 0;
+    uint64_t fps_last_log_us = esp_timer_get_time();
 
     while (s_running) {
         vTaskDelayUntil(&last_wake, frame_ticks);
+        fps_frames++;
 
         if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
             draw_bitmap_locked();
             xSemaphoreGive(s_lock);
+        }
+
+        uint64_t now_us = esp_timer_get_time();
+        uint64_t fps_elapsed_us = now_us - fps_last_log_us;
+        if (fps_elapsed_us >= 1000000ULL) {
+            uint32_t fps_x10 = (fps_elapsed_us > 0)
+                                  ? (uint32_t)(((uint64_t)fps_frames * 10000000ULL +
+                                                (fps_elapsed_us / 2ULL)) /
+                                               fps_elapsed_us)
+                                  : 0;
+            ESP_LOGI(TAG, "refresh fps=%u.%u", fps_x10 / 10U, fps_x10 % 10U);
+            fps_frames = 0;
+            fps_last_log_us = now_us;
         }
     }
 

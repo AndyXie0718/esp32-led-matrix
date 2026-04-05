@@ -17,7 +17,7 @@
 #define W PANEL_WIDTH
 #define H PANEL_HEIGHT
 
-#define SIM_FPS 30
+#define SIM_FPS 90
 #define LED_VAL_MAX_I PANEL_LED_VALUE_MAX
 
 #define KEY_GPIO_PIN GPIO_NUM_0
@@ -118,7 +118,7 @@ static void build_fire_led_map_once(void) {
     }
     for (int y = 0; y < H; y++) {
         for (int x = 0; x < W; x++) {
-            s_fire_led_map[y * W + x] = (uint16_t)panel_led_index(x, H - 1 - y);
+            s_fire_led_map[y * W + x] = (uint16_t)panel_led_index(x, y);
         }
     }
     s_fire_led_map_ready = true;
@@ -147,9 +147,12 @@ static void sim_task(void* arg) {
 
     TickType_t last_wake = xTaskGetTickCount();
     const TickType_t frame_ticks = pdMS_TO_TICKS(1000 / SIM_FPS);
+    uint32_t fps_frames = 0;
+    uint64_t fps_last_log_us = esp_timer_get_time();
 
     while (s_running) {
         vTaskDelayUntil(&last_wake, frame_ticks);
+        fps_frames++;
 
         gravity_xy_t g = gravity_get();
         float gx = 0.0f;
@@ -177,6 +180,7 @@ static void sim_task(void* arg) {
         const float* heat = doom_fire_heat(&fire);
         for (int y = 0; y < H; y++) {
             for (int x = 0; x < W; x++) {
+                uint16_t idx = s_fire_led_map[y * W + x];
                 float v = heat[y * W + x];
                 if (v < 0.0f) {
                     v = 0.0f;
@@ -194,11 +198,23 @@ static void sim_task(void* arg) {
                 }
 
                 rgb8_t c = s_lut[s_palette_idx][hv];
-                uint16_t idx = s_fire_led_map[y * W + x];
                 rgb_set_fast((uint32_t)idx, c.r, c.g, c.b);
             }
         }
         rgb_show();
+
+        uint64_t now_us = esp_timer_get_time();
+        uint64_t fps_elapsed_us = now_us - fps_last_log_us;
+        if (fps_elapsed_us >= 1000000ULL) {
+            uint32_t fps_x10 = (fps_elapsed_us > 0)
+                                  ? (uint32_t)(((uint64_t)fps_frames * 10000000ULL +
+                                                (fps_elapsed_us / 2ULL)) /
+                                               fps_elapsed_us)
+                                  : 0;
+            ESP_LOGI(TAG, "refresh fps=%u.%u", fps_x10 / 10U, fps_x10 % 10U);
+            fps_frames = 0;
+            fps_last_log_us = now_us;
+        }
     }
 
 exit_task:

@@ -17,7 +17,7 @@
 #define H PANEL_HEIGHT
 #define LED_COUNT PANEL_LED_COUNT
 
-#define SIM_FPS 30
+#define SIM_FPS 90
 
 #define LED_VAL_MAX_I PANEL_LED_VALUE_MAX
 #define LED_VAL_MAX_F ((float)PANEL_LED_VALUE_MAX)
@@ -162,6 +162,8 @@ static void sim_task(void* arg) {
     uint64_t perf_sum_us = 0;
     uint32_t perf_max_us = 0;
     uint64_t perf_last_log_us = esp_timer_get_time();
+    uint32_t fps_frames = 0;
+    uint64_t fps_last_log_us = perf_last_log_us;
 
     while (s_running) {
         vTaskDelayUntil(&last_wake, frame_ticks);
@@ -212,12 +214,25 @@ static void sim_task(void* arg) {
 
         uint32_t frame_us = (uint32_t)(esp_timer_get_time() - frame_begin_us);
         perf_frames++;
+        fps_frames++;
         perf_sum_us += frame_us;
         if (frame_us > perf_max_us) {
             perf_max_us = frame_us;
         }
 
         uint64_t now_us = esp_timer_get_time();
+        uint64_t fps_elapsed_us = now_us - fps_last_log_us;
+        if (fps_elapsed_us >= 1000000ULL) {
+            uint32_t fps_x10 = (fps_elapsed_us > 0)
+                                  ? (uint32_t)(((uint64_t)fps_frames * 10000000ULL +
+                                                (fps_elapsed_us / 2ULL)) /
+                                               fps_elapsed_us)
+                                  : 0;
+            ESP_LOGI(TAG, "refresh fps=%u.%u", fps_x10 / 10U, fps_x10 % 10U);
+            fps_frames = 0;
+            fps_last_log_us = now_us;
+        }
+
         if (now_us - perf_last_log_us >= 2000000ULL) {
             const uint32_t budget_us = (1000000 / SIM_FPS);
             uint32_t avg_us =

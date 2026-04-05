@@ -33,8 +33,9 @@ static inline int rng_int(uint32_t* s, int n) {
 
 void doom_fire_init(doom_fire_t* f, uint32_t seed) {
     dsps_memset(f, 0, sizeof(*f));
-    f->decay = 3.0f;
-    f->intensity = 36.0f;
+    // Tune for small panels (e.g. 8x8): visible but not full-screen fire.
+    f->decay = 4.0f;
+    f->intensity = 30.0f;
     f->rng = (seed == 0) ? 1u : seed;
 }
 
@@ -53,10 +54,10 @@ static void propagate(doom_fire_t* f, float gravity_x) {
     const float gravity_strength = fabsf(gx);
     const float horizontal_drift = -(gx * 3.0f);
 
-    const float w_up = 3.8f;
-    const float w_below = 0.5f;
-    const float w_left = fmax2(0.0f, 1.0f + horizontal_drift);
-    const float w_right = fmax2(0.0f, 1.0f - horizontal_drift);
+    const float w_up = 4.2f;
+    const float w_below = 0.35f;
+    const float w_left = fmax2(0.0f, 0.85f + horizontal_drift * 0.8f);
+    const float w_right = fmax2(0.0f, 0.85f - horizontal_drift * 0.8f);
     const float total = fmax2(1.0f, w_up + w_below + w_left + w_right);
     const float inv_total = 1.0f / total;
     const float taper_relax = fmax2(0.2f, 1.0f - gravity_strength * 0.3f);
@@ -102,8 +103,8 @@ static void propagate(doom_fire_t* f, float gravity_x) {
             const float new_heat = fmax2(0.0f, avg - cooling);
             f->next[y * DOOM_W + x] = new_heat;
 
-            if (new_heat > 12.0f && rng_f01(&f->rng) < 0.006f) {
-                const int jump = 2 + rng_int(&f->rng, 4);
+            if (new_heat > 12.0f && rng_f01(&f->rng) < 0.005f) {
+                const int jump = 1 + rng_int(&f->rng, 3);
                 const int ty = y - jump;
 
                 int tx = x + (rng_int(&f->rng, 3) - 1) + drift_shift;
@@ -112,7 +113,7 @@ static void propagate(doom_fire_t* f, float gravity_x) {
                 if (ty >= 0) {
                     const int tidx = ty * DOOM_W + tx;
                     const float spark =
-                        fmin2(new_heat * 2.2f + 10.0f, (float)DOOM_HEAT_MAX);
+                        fmin2(new_heat * 1.45f + 7.0f, (float)DOOM_HEAT_MAX);
                     if (spark > f->next[tidx]) {
                         f->next[tidx] = spark;
                     }
@@ -125,28 +126,33 @@ static void propagate(doom_fire_t* f, float gravity_x) {
 static void ignite(doom_fire_t* f, uint32_t t_ms) {
     const float t = (float)t_ms;
 
-    const float sway = sinf(t / 800.0f) * 1.2f + sinf(t / 350.0f) * 0.5f;
+    const float sway = sinf(t / 900.0f) * 0.8f + sinf(t / 420.0f) * 0.35f;
     const float cx = (DOOM_W - 1) * 0.5f + sway;
-    const float cy = (float)DOOM_H - 5.5f;
-    const float radius = 4.8f;
+    const int ignite_rows = iclamp(DOOM_H / 2, 3, 5);
+    const int ignite_y0 = DOOM_H - ignite_rows;
+    const float cy = (float)(DOOM_H - 1) - 0.45f;
+    const float rx = fmax2(1.8f, (float)DOOM_W * 0.32f);
+    const float ry = fmax2(1.1f, (float)ignite_rows * 0.9f);
 
-    const float breathing = sinf(t / 200.0f) * 4.0f;
-    const float flicker = rng_f01(&f->rng) * 2.0f;
+    const float breathing = sinf(t / 230.0f) * 2.8f;
+    const float flicker = rng_f01(&f->rng) * 2.2f;
     const float base_intensity = fmax2(0.0f, f->intensity + breathing - flicker);
 
-    for (int y = DOOM_H - 12; y < DOOM_H; y++) {
+    for (int y = ignite_y0; y < DOOM_H; y++) {
         for (int x = 0; x < DOOM_W; x++) {
-            const float dx = (float)x - cx;
-            const float dy = (float)y - cy;
-            const float dist = sqrtf(dx * dx + dy * dy);
+            const float dx = ((float)x - cx) / rx;
+            const float dy = ((float)y - cy) / ry;
+            const float r2 = dx * dx + dy * dy;
+            if (r2 > 1.0f) {
+                continue;
+            }
 
-            if (dist <= radius) {
-                const float falloff = cosf((dist / radius) * (PI_F * 0.5f));
-                const float heat = base_intensity * falloff;
-                const int idx = y * DOOM_W + x;
-                if (heat > f->next[idx]) {
-                    f->next[idx] = heat;
-                }
+            const float falloff = 1.0f - r2;
+            const float edge_noise = 0.85f + rng_f01(&f->rng) * 0.25f;
+            const float heat = base_intensity * falloff * edge_noise;
+            const int idx = y * DOOM_W + x;
+            if (heat > f->next[idx]) {
+                f->next[idx] = heat;
             }
         }
     }

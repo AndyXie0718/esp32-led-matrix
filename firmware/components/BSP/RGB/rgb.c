@@ -6,7 +6,7 @@
 #include "led_strip.h"
 #include "panel_config.h"
 
-#define RGB_GPIO_PIN 10
+#define RGB_GPIO_PIN 20
 #define RGB_LED_COUNT PANEL_LED_COUNT
 #define RGB_SPI_HOST SPI2_HOST
 

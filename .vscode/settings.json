@@ -1,3 +1,8 @@
 {
-    "cmake.sourceDirectory": "F:/ESP32/esp32-led-matrix/firmware"
+    "cmake.sourceDirectory": "F:/ESP32/esp32-led-matrix/firmware",
+    "idf.currentSetup": "D:\\Tools\\.espressif\\v5.5.3\\esp-idf",
+    "idf.openOcdConfigs": [
+        "board/esp32c3-builtin.cfg"
+    ],
+    "idf.portWin": "COM23"
 }
