@@ -125,16 +125,30 @@ static void propagate(doom_fire_t* f, float gravity_x) {
 static void ignite(doom_fire_t* f, uint32_t t_ms) {
     const float t = (float)t_ms;
 
-    const float sway = sinf(t / 800.0f) * 1.2f + sinf(t / 350.0f) * 0.5f;
-    const float cx = (DOOM_W - 1) * 0.5f + sway;
-    const float cy = (float)DOOM_H - 5.5f;
-    const float radius = 4.8f;
+    float sway = sinf(t / 800.0f) * 1.2f + sinf(t / 350.0f) * 0.5f;
+    const float sway_limit = fmax2(0.6f, (float)DOOM_W * 0.16f);
+    sway = fmin2(fmax2(sway, -sway_limit), sway_limit);
+    float cx = (DOOM_W - 1) * 0.5f + sway;
+    cx = fmin2(fmax2(cx, 0.8f), (float)DOOM_W - 1.8f);
+    const float cy = (float)DOOM_H - 1.8f;
+    float radius = (float)((DOOM_W < DOOM_H) ? DOOM_W : DOOM_H) * 0.45f;
+    if (radius < 1.8f) {
+        radius = 1.8f;
+    }
+    if (radius > 3.8f) {
+        radius = 3.8f;
+    }
 
     const float breathing = sinf(t / 200.0f) * 4.0f;
     const float flicker = rng_f01(&f->rng) * 2.0f;
     const float base_intensity = fmax2(0.0f, f->intensity + breathing - flicker);
 
-    for (int y = DOOM_H - 12; y < DOOM_H; y++) {
+    int y_start = DOOM_H - 12;
+    if (y_start < 0) {
+        y_start = 0;
+    }
+
+    for (int y = y_start; y < DOOM_H; y++) {
         for (int x = 0; x < DOOM_W; x++) {
             const float dx = (float)x - cx;
             const float dy = (float)y - cy;

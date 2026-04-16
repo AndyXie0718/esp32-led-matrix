@@ -182,6 +182,13 @@ static void sim_task(void* arg) {
             ESP_LOGD(TAG, "palette -> %u", (unsigned)s_palette_idx);
         }
 
+        uint8_t global_r = 255;
+        uint8_t global_g = 255;
+        uint8_t global_b = 255;
+        rgb_get_global_color8(&global_r, &global_g, &global_b);
+        const bool use_global_color =
+            !(global_r == 255 && global_g == 255 && global_b == 255);
+
         for (int y = 0; y < H; y++) {
             for (int x = 0; x < W; x++) {
                 float v = grid_get(grid, x, y);
@@ -203,7 +210,17 @@ static void sim_task(void* arg) {
                     lv = LED_LEVELS - 1;
                 }
 
-                rgb8_t c = s_pal_lut[s_palette_idx][lv];
+                rgb8_t c;
+                if (use_global_color) {
+                    c.r = (uint8_t)(((uint16_t)global_r * (uint16_t)lv) /
+                                    LED_VAL_MAX_I);
+                    c.g = (uint8_t)(((uint16_t)global_g * (uint16_t)lv) /
+                                    LED_VAL_MAX_I);
+                    c.b = (uint8_t)(((uint16_t)global_b * (uint16_t)lv) /
+                                    LED_VAL_MAX_I);
+                } else {
+                    c = s_pal_lut[s_palette_idx][lv];
+                }
                 int idx = panel_led_index(x, y);
                 rgb_set((uint32_t)idx, c.r, c.g, c.b);
             }
