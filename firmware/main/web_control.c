@@ -6,51 +6,64 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* -- 引入系统与外设支持 -- */
 #include "custom_sim.h"
 #include "esp_event.h"
-#include "esp_http_client.h"
-#include "esp_http_server.h"
+#include "esp_http_client.h"    // 提供 HTTP 客户端，支持我们充当 AI 的反向代理
+#include "esp_http_server.h"    // 提供 HTTP 服务端，响应手机浏览器的请求
 #include "esp_log.h"
-#include "esp_netif.h"
-#include "esp_crt_bundle.h"
-#include "esp_wifi.h"
-#include "lwip/lwip_napt.h"
-#include "nvs.h"
+#include "esp_netif.h"          // 底层网络接口，处理 IP、DHCP 等
+#include "esp_crt_bundle.h"     // 根证书束，用于建立安全的 HTTPS SSL 链接
+#include "esp_wifi.h"           // Wi-Fi 驱动控制
+#include "lwip/lwip_napt.h"     // LwIP 提供的 NAT (网络地址转换)，让连上 ESP32 的手机能上网
+#include "nvs.h"                // 非易失性存储，保存断电不丢失的密码
 #include "nvs_flash.h"
 #include "panel_config.h"
 #include "rgb.h"
 #include "sim_manager.h"
 
+/* ================= 宏定义区 ================= */
+// ESP32 作为无线热点(AP) 时的默认配置
 #define AP_SSID "LED-Matrix"
 #define AP_PASS "12345678"
 #define AP_CHANNEL 1
 #define AP_MAX_CONN 4
-#define WIFI_NVS_NS "wifi_sta"
-#define WIFI_NVS_KEY_SSID "ssid"
-#define WIFI_NVS_KEY_PASS "pass"
+
+// NVS 存储配置字典的键名
+#define WIFI_NVS_NS "wifi_sta"              // 命名空间
+#define WIFI_NVS_KEY_SSID "ssid"            // 路由器的 SSID 键
+#define WIFI_NVS_KEY_PASS "pass"            // 路由器的 密码 键
+
+// AI 对接配置 (本项目对接智谱 GLM-4)
 #define CHAT_API_URL "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-#define CHAT_MAX_REQUEST_BODY 32768
-#define CHAT_MAX_API_KEY_LEN 192
+#define CHAT_MAX_REQUEST_BODY 32768         // AI 对话内容的最大缓存(32KB)，包含上下文字符串
+#define CHAT_MAX_API_KEY_LEN 192            // 存放 Bearer Token 鉴权码的长度
 
 static const char* TAG = "web_control";
 
-static httpd_handle_t s_server = NULL;
-static bool s_sta_connected = false;
-static char s_sta_ssid[33] = {0};
-static char s_sta_ip[16] = {0};
-static char s_sta_pass[65] = {0};
-static bool s_wifi_only_mode = false;
-static sim_mode_t s_resume_mode = SIM_MODE_WATER;
-static esp_netif_t* s_ap_netif = NULL;
-static esp_netif_t* s_sta_netif = NULL;
-static bool s_ap_dhcp_dns_offer_ready = false;
+/* ================= 全局状态变量 ================= */
+static httpd_handle_t s_server = NULL;              // HTTP 服务端句柄
+static bool s_sta_connected = false;                // 标记 ESP32 是否已成功连接到路由器
+static char s_sta_ssid[33] = {0};                   // 缓存路由器 SSID
+static char s_sta_ip[16] = {0};                     // 缓存本机从路由器获取的 IP (例如 192.168.1.x)
+static char s_sta_pass[65] = {0};                   // 缓存路由器密码
+static bool s_wifi_only_mode = false;               // 纯网络模式（关闭所有 LED 计算，释放全部 CPU 算力给网络）
+static sim_mode_t s_resume_mode = SIM_MODE_WATER;   // 退出纯网络模式后，恢复什么动画模式
+static esp_netif_t* s_ap_netif = NULL;              // AP 模式的虚拟网卡接口
+static esp_netif_t* s_sta_netif = NULL;             // STA（终端）模式的虚拟网卡接口
+static bool s_ap_dhcp_dns_offer_ready = false;      // 标记是否已经给连入 ESP32 的设备派发了 DNS
 
+/**
+ * @brief 切换“纯网络(路由器)模式”
+ * @details 开启后，停止所有物理特效动画，清空并关闭 LED 输出，从而降低功耗和发热，使 ESP32 专业做路由器透传。
+ */
 static void apply_wifi_only_mode(bool enable) {
     if (enable == s_wifi_only_mode) {
-        return;
+        return; // 状态相同忽略
     }
 
     if (enable) {
+        // 记录当前的动画特效，之后停掉它
         sim_mode_t cur = sim_manager_current();
         if (cur != SIM_MODE_NONE) {
             s_resume_mode = cur;
@@ -61,13 +74,14 @@ static void apply_wifi_only_mode(bool enable) {
             ESP_LOGW(TAG, "sim_manager_stop failed: %s", esp_err_to_name(err));
         }
 
-        rgb_clear();
-        rgb_show();
+        rgb_clear();    // 清理显存
+        rgb_show();     // 刷黑屏幕
         s_wifi_only_mode = true;
         ESP_LOGI(TAG, "wifi-only mode enabled");
         return;
     }
 
+    // 禁用纯网络模式，重新跑起动画任务
     s_wifi_only_mode = false;
     if (sim_manager_current() == SIM_MODE_NONE) {
         sim_mode_t resume = (s_resume_mode == SIM_MODE_NONE) ? SIM_MODE_WATER : s_resume_mode;
@@ -79,17 +93,24 @@ static void apply_wifi_only_mode(bool enable) {
     ESP_LOGI(TAG, "wifi-only mode disabled");
 }
 
+/**
+ * @brief 开启/关闭 NAT (网络地址转发)
+ * @details 将连上 ESP32 AP 的手机请求，通过 ESP32 STA 网卡转发给真正的外网路由器。
+ * @note 必须在 menuconfig 中开启 CONFIG_LWIP_IPV4_NAPT
+ */
 static void set_nat_enabled(bool enabled) {
 #if CONFIG_LWIP_IPV4_NAPT
     if (!s_ap_netif) {
         return;
     }
 
+    // 获取 AP 接口当前的 IP 地址
     esp_netif_ip_info_t ap_ip;
     if (esp_netif_get_ip_info(s_ap_netif, &ap_ip) != ESP_OK) {
         return;
     }
 
+    // 调用 LwIP 底层接口，开启对当前网段的 NAT 转发
     ip_napt_enable(ap_ip.ip.addr, enabled ? 1 : 0);
     ESP_LOGI(TAG, "NAT %s on AP ip: " IPSTR, enabled ? "enabled" : "disabled", IP2STR(&ap_ip.ip));
 #else
@@ -98,17 +119,23 @@ static void set_nat_enabled(bool enabled) {
 #endif
 }
 
+/**
+ * @brief 确保 AP DHCP 服务器能够下发 DNS 配置
+ * @details 手机连上 ESP32 的热点时，如果 ESP32 不提供 DNS，手机上网解析域名会失败。这是 NAT 架构中的关键步骤。
+ */
 static void ensure_ap_dhcp_offers_dns(void) {
     if (!s_ap_netif || s_ap_dhcp_dns_offer_ready) {
         return;
     }
 
+    // 修改 DHCP 选项必须先停掉 DHCP 服务器
     esp_err_t err = esp_netif_dhcps_stop(s_ap_netif);
     if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
         ESP_LOGW(TAG, "stop AP DHCP server failed: %s", esp_err_to_name(err));
         return;
     }
 
+    // 启用发放 DNS_SERVER 选项
     uint8_t offer_dns = 1;
     err = esp_netif_dhcps_option(
         s_ap_netif,
@@ -120,6 +147,7 @@ static void ensure_ap_dhcp_offers_dns(void) {
         ESP_LOGW(TAG, "enable AP DHCP DNS offer failed: %s", esp_err_to_name(err));
     }
 
+    // 重新启动 DHCP 服务器
     esp_err_t err2 = esp_netif_dhcps_start(s_ap_netif);
     if (err2 != ESP_OK && err2 != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
         ESP_LOGW(TAG, "start AP DHCP server failed: %s", esp_err_to_name(err2));
@@ -131,6 +159,10 @@ static void ensure_ap_dhcp_offers_dns(void) {
     }
 }
 
+/**
+ * @brief 将 STA 获取的真实 DNS 同步给 AP
+ * @details 让连上 AP 的设备使用的 DNS 等同于外网路由器提供的 DNS。
+ */
 static void sync_ap_dns_from_sta(void) {
     if (!s_ap_netif || !s_sta_netif) {
         return;
@@ -143,6 +175,7 @@ static void sync_ap_dns_from_sta(void) {
         return;
     }
 
+    // 将 DNS 赋值给 AP 网卡
     err = esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &dns_main);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "set AP DNS failed: %s", esp_err_to_name(err));
@@ -152,18 +185,25 @@ static void sync_ap_dns_from_sta(void) {
     ESP_LOGI(TAG, "AP DHCP DNS synced to: " IPSTR, IP2STR(&dns_main.ip.u_addr.ip4));
 }
 
+/**
+ * @brief 将 Wi-Fi 连接信息存入非易失性 NVS 以备断电重启
+ */
 static esp_err_t save_sta_credentials(const char* ssid, const char* pass) {
     nvs_handle_t handle;
+    // 打开 NVS 分区（必须带有 NVS_READWRITE 权限）
     esp_err_t err = nvs_open(WIFI_NVS_NS, NVS_READWRITE, &handle);
     if (err != ESP_OK) {
         return err;
     }
 
+    // 存储 SSID
     err = nvs_set_str(handle, WIFI_NVS_KEY_SSID, ssid ? ssid : "");
     if (err == ESP_OK) {
+        // 存储 Password
         err = nvs_set_str(handle, WIFI_NVS_KEY_PASS, pass ? pass : "");
     }
     if (err == ESP_OK) {
+        // 必须 commit 否则重启丢失
         err = nvs_commit(handle);
     }
 
@@ -171,6 +211,9 @@ static esp_err_t save_sta_credentials(const char* ssid, const char* pass) {
     return err;
 }
 
+/**
+ * @brief 开机时尝试从 NVS 恢复之前的 Wi-Fi 连接信息
+ */
 static esp_err_t load_sta_credentials(char* ssid, size_t ssid_len, char* pass, size_t pass_len, bool* has_data) {
     if (!ssid || !pass || !has_data) {
         return ESP_ERR_INVALID_ARG;
@@ -183,11 +226,12 @@ static esp_err_t load_sta_credentials(char* ssid, size_t ssid_len, char* pass, s
     nvs_handle_t handle;
     esp_err_t err = nvs_open(WIFI_NVS_NS, NVS_READONLY, &handle);
     if (err != ESP_OK) {
-        return err;
+        return err; // 初次启动时命名空间不存在也会报 err，可直接返回
     }
 
     size_t ssid_size = ssid_len;
     size_t pass_size = pass_len;
+    // 获取大小受限的字符串，确保不会越界
     err = nvs_get_str(handle, WIFI_NVS_KEY_SSID, ssid, &ssid_size);
     if (err == ESP_OK) {
         err = nvs_get_str(handle, WIFI_NVS_KEY_PASS, pass, &pass_size);
@@ -321,6 +365,16 @@ static bool read_header_value(httpd_req_t* req, const char* name, char* out, siz
     return out[0] != '\0';
 }
 
+/**
+ * @brief 安全读取 HTTP 请求的 Body 数据
+ * @details 嵌入式设备极容易受到缓冲区溢出攻击。
+ *          此函数在读取任何数据前，先检查 Header 里的 Content-Length。
+ *          如果超过最大允许长度 `max_len`，则直接拒绝，防止把单片机内存撑爆导致死机。
+ * @param req HTTP 请求句柄
+ * @param max_len 允许的最大 Body 长度
+ * @param out_body 输出的字符串指针，调用方用完必须 free()
+ * @param out_len 输出获取到的实际长度
+ */
 static esp_err_t read_request_body(httpd_req_t* req, size_t max_len, char** out_body, size_t* out_len) {
     if (!req || !out_body || !out_len) {
         return ESP_ERR_INVALID_ARG;
@@ -330,18 +384,21 @@ static esp_err_t read_request_body(httpd_req_t* req, size_t max_len, char** out_
     *out_len = 0;
 
     int content_len = req->content_len;
+    // 危险防御：拦截不合理或超长的数据体积
     if (content_len <= 0 || (size_t)content_len > max_len) {
         httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "payload too large");
         return ESP_ERR_INVALID_SIZE;
     }
 
+    // 根据声明长度动态分配内存块 (+1 用于存 '\0' 终结符)
     char* body = (char*)malloc((size_t)content_len + 1);
     if (!body) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
-        return ESP_ERR_NO_MEM;
+        return ESP_ERR_NO_MEM;  // Out Of Memory
     }
 
     int offset = 0;
+    // 循环接收数据，因为底层 TCP/IP 栈可能会分段上传大数据包
     while (offset < content_len) {
         int got = httpd_req_recv(req, body + offset, content_len - offset);
         if (got <= 0) {
@@ -377,13 +434,23 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     }
 }
 
+/**
+ * @brief AI 聊天透明反向代理终端 (反向网关核心模块)
+ * @details 将手机页面的聊天请求，以安全的 HTTPS 转发给云端大模型 API。
+ *          这么做的原因：
+ *          1. 保护 API Key：不会直接暴露在前端的 JS 代码中。
+ *          2. 绕过浏览器的跨域 (CORS) 限制。
+ *          3. 将 AI 返回的控制指令直接作用于本地硬件（灯珠）。
+ */
 static esp_err_t chat_post_handler(httpd_req_t* req) {
+    // 1. 鉴权：尝试获取 Header 中的 API_KEY
     char api_key[CHAT_MAX_API_KEY_LEN] = {0};
     if (!read_header_value(req, "X-Zhipu-Api-Key", api_key, sizeof(api_key))) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing api key");
         return ESP_OK;
     }
 
+    // 2. 读取用户的对话请求体 (Prompt)
     char* body = NULL;
     size_t body_len = 0;
     esp_err_t err = read_request_body(req, CHAT_MAX_REQUEST_BODY, &body, &body_len);
@@ -392,14 +459,15 @@ static esp_err_t chat_post_handler(httpd_req_t* req) {
     }
     ESP_LOGI(TAG, "chat request: %.*s", (int)((body_len > 256) ? 256 : body_len), body);
 
+    // 3. 配置连接下游（大模型）的 HTTPS 客户端参数
     esp_http_client_config_t config = {
-        .url = CHAT_API_URL,
+        .url = CHAT_API_URL,                     // 智谱 API
         .method = HTTP_METHOD_POST,
         .transport_type = HTTP_TRANSPORT_OVER_SSL,
-        .timeout_ms = 480000,
+        .timeout_ms = 480000,                    // 由于生成式文本时间长，必须设远大于普通的超时
         .buffer_size = 1024,
         .buffer_size_tx = 1024,
-        .crt_bundle_attach = esp_crt_bundle_attach,
+        .crt_bundle_attach = esp_crt_bundle_attach, // 使用内置证书验证，防中间人劫持
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -409,6 +477,7 @@ static esp_err_t chat_post_handler(httpd_req_t* req) {
         return ESP_OK;
     }
 
+    // 4. 重构并发送 Header 参数给大模型
     char auth[CHAT_MAX_API_KEY_LEN + 16];
     snprintf(auth, sizeof(auth), "Bearer %s", api_key);
     esp_http_client_set_header(client, "Content-Type", "application/json");
@@ -423,6 +492,7 @@ static esp_err_t chat_post_handler(httpd_req_t* req) {
         return ESP_OK;
     }
 
+    // 5. 循环写入我们将代理的数据
     int written = 0;
     while (written < (int)body_len) {
         int w = esp_http_client_write(client, body + written, (int)body_len - written);
@@ -443,6 +513,7 @@ static esp_err_t chat_post_handler(httpd_req_t* req) {
                  esp_err_to_name((esp_err_t)header_len));
     }
 
+    // 6. 处理返回状态：被大模型 API 拦截或降级保护
     int status = esp_http_client_get_status_code(client);
     httpd_resp_set_type(req, "application/json");
     bool sent_any = false;
@@ -452,7 +523,7 @@ static esp_err_t chat_post_handler(httpd_req_t* req) {
     if (status > 0 && (status < 200 || status >= 300)) {
         char resp[160];
         if (status == 429) {
-            ESP_LOGW(TAG, "chat upstream rate limited (429)");
+            ESP_LOGW(TAG, "chat upstream rate limited (429)"); // 并发过高保护
             snprintf(resp, sizeof(resp),
                      "{\"error\":\"rate_limited\",\"message\":\"upstream status 429\"}");
             httpd_resp_set_status(req, "429 Too Many Requests");
@@ -467,6 +538,9 @@ static esp_err_t chat_post_handler(httpd_req_t* req) {
         return ESP_OK;
     }
 
+    // 7. 开启流式响应中继 (Streaming Reverse Proxy)
+    // 这是核心级优化：我们不等待整段上万字的回复堆满缓存，而是每次读1024字就发给手机
+    // 这让单片机有能力做重型 AI 推理中间件。
     char chunk[1024];
     while (1) {
         int read = esp_http_client_read(client, chunk, sizeof(chunk));
@@ -481,8 +555,9 @@ static esp_err_t chat_post_handler(httpd_req_t* req) {
             return ESP_OK;
         }
         if (read == 0) {
-            break;
+            break; // 大模型回答结束
         }
+        // 调用分块发送 API 立刻发往手机浏览器
         if (httpd_resp_send_chunk(req, chunk, read) != ESP_OK) {
             ESP_LOGW(TAG, "chat send chunk failed");
             esp_http_client_close(client);
@@ -490,6 +565,7 @@ static esp_err_t chat_post_handler(httpd_req_t* req) {
             free(body);
             return ESP_OK;
         }
+        // 以下逻辑截取预览，仅供串口打印日志做本地诊断使用
         if (upstream_preview_len < sizeof(upstream_preview) - 1) {
             size_t cap = (sizeof(upstream_preview) - 1) - upstream_preview_len;
             size_t cp = ((size_t)read < cap) ? (size_t)read : cap;
@@ -500,8 +576,11 @@ static esp_err_t chat_post_handler(httpd_req_t* req) {
         sent_any = true;
     }
 
+    // 声明分块传输结束
     httpd_resp_send_chunk(req, NULL, 0);
     ESP_LOGI(TAG, "chat upstream status=%d preview=%s", status, upstream_preview);
+    
+    // 清理连接并释放系统资源
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
     free(body);
@@ -527,6 +606,17 @@ static void ip_event_handler(void* arg, esp_event_base_t event_base, int32_t eve
     }
 }
 
+/**
+ * @brief 嵌入式网页前端代码 (SPA: Single Page Application)
+ * @details 将所有 HTML、CSS (样式)、JS (逻辑) 压缩并硬编码在这一个常量字符串中。
+ *          这么做的原因：
+ *          1. 单片机没有通常意义上的大容量文件系统，直接存在 Flash 代码段（rodata）最省空间。
+ *          2. 无需发起二次 HTTP 请求获取 css 和 js 文件，加载极其迅速。
+ *          前端架构功能包含：
+ *          - 模式切换控制台 (火、水、自定义像素绘图)
+ *          - Wi-Fi 路由连接配置管理
+ *          - LLM 接入聊天面板，支持实时推理并通过 /api/chat 与单片机后台通信
+ */
 static const char s_index_html[] =
     "<!doctype html><html><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -698,13 +788,22 @@ static esp_err_t root_get_handler(httpd_req_t* req) {
     return ESP_OK;
 }
 
+/**
+ * @brief GET 接口：查询系统当前状态概览
+ * @details 前端加载时，或连接 Wi-Fi 成功后，会掉这个接口刷新同步设备的实际硬件参数。
+ *          通过 `snprintf` 动态拼装 JSON 字符串。
+ */
 static esp_err_t state_get_handler(httpd_req_t* req) {
     char resp[224];
     const char* mode = mode_to_str(sim_manager_current());
+    
+    // 获取当下的物理全局色彩
     uint8_t r8 = 0;
     uint8_t g8 = 0;
     uint8_t b8 = 0;
     rgb_get_global_color8(&r8, &g8, &b8);
+    
+    // 组装格式化响应串
     snprintf(resp, sizeof(resp),
              "{\"mode\":\"%s\",\"r8\":%u,\"g8\":%u,\"b8\":%u,\"sta_connected\":%s,\"sta_ssid\":\"%s\",\"sta_ip\":\"%s\",\"wifi_only\":%s}",
              mode, (unsigned)r8, (unsigned)g8, (unsigned)b8,
@@ -718,12 +817,20 @@ static esp_err_t state_get_handler(httpd_req_t* req) {
 
 static esp_err_t chat_post_handler(httpd_req_t* req);
 
+/**
+ * @brief 拦截保护：验证是不是来自 AI 控制的后台隐式修改请求
+ */
 static bool is_chat_control_request(httpd_req_t* req) {
     char value[8] = {0};
     return read_header_value(req, "X-Chat-Control", value, sizeof(value));
 }
 
+/**
+ * @brief POST 接口：模式切换中枢
+ * @details 根据参数请求（如 `?value=fire`），让单片机切换底层物理特效的运行态。
+ */
 static esp_err_t mode_post_handler(httpd_req_t* req) {
+    // 1. 判断是否被纯网卡(路由器)抢占，如果开启了纯网络模式，禁止人类调节屏幕
     bool from_ai = is_chat_control_request(req);
     if (s_wifi_only_mode && !from_ai) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "wifi-only enabled");
@@ -733,12 +840,14 @@ static esp_err_t mode_post_handler(httpd_req_t* req) {
     char query[64] = {0};
     char value[16] = {0};
 
+    // 2. 从 HTTP 的 URL query 参数中解析所需切换的目标模式
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
         httpd_query_key_value(query, "value", value, sizeof(value)) != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing value");
         return ESP_OK;
     }
 
+    // 3. 校验模式字段的合法性
     sim_mode_t mode = SIM_MODE_NONE;
     if (!str_to_mode(value, &mode)) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid mode");
@@ -748,6 +857,7 @@ static esp_err_t mode_post_handler(httpd_req_t* req) {
         ESP_LOGI(TAG, "ai control mode=%s", value);
     }
 
+    // 4. 调用 RTOS 管理器安全地销毁旧任务，起飞新任务
     esp_err_t err = sim_manager_switch(mode);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "switch mode failed: %s", esp_err_to_name(err));
@@ -755,11 +865,16 @@ static esp_err_t mode_post_handler(httpd_req_t* req) {
         return ESP_OK;
     }
 
+    // 5. 告知前端执行成功
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
 }
 
+/**
+ * @brief POST 接口：处理来自前端画布或 AI 生成的 8x8 像素点阵图
+ * @details 逐字解析 '0'/'1' 的 64 位数组，再向下发往自定义特效模块 (`custom_sim_set_bitmap`)。
+ */
 static esp_err_t custom_post_handler(httpd_req_t* req) {
     bool from_ai = is_chat_control_request(req);
     if (s_wifi_only_mode && !from_ai) {
@@ -908,6 +1023,10 @@ static esp_err_t color_post_handler(httpd_req_t* req) {
     return ESP_OK;
 }
 
+/**
+ * @brief POST 接口：处理网页下发的 Wi-Fi STA 配网请求
+ * @details 接收用户输入的 SSID 和密码，并控制底层的 ESP32 Wi-Fi 栈进行连接（热点加入）。
+ */
 static esp_err_t wifi_connect_post_handler(httpd_req_t* req) {
     char body[256] = {0};
     int remain = req->content_len;
@@ -1004,6 +1123,11 @@ static esp_err_t wifi_only_post_handler(httpd_req_t* req) {
     return ESP_OK;
 }
 
+/**
+ * @brief 初始化 ESP32 网络堆栈，并开启 AP (SoftAP热点)
+ * @details 将设备配制成 AP+STA 并存模式，发出自身 Wi-Fi 信号的同时保留后续连接路由器的能力。
+ *          若检测到 NVS 区已有保存好的网络信息，则会自动进行上流路由器重连。
+ */
 static esp_err_t start_softap(void) {
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -1092,6 +1216,10 @@ static esp_err_t start_softap(void) {
     return ESP_OK;
 }
 
+/**
+ * @brief 注册并孵化嵌入式 HTTP Web Server
+ * @details 负责所有向外暴露的 API 端点 (Endpoint) 的路由注册注册与栈尺寸配置。
+ */
 static esp_err_t start_http_server(void) {
     if (s_server) {
         return ESP_OK;

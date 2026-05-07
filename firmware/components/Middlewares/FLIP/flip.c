@@ -32,10 +32,14 @@ Modifications/port to C:
 #define DENSITY_CLAMP_F 1.2f
 #define GAMMA_F 0.6f
 
-// gamma LUT
+// Gamma 查找表：把线性亮度映射成更符合肉眼感知的非线性亮度
 static bool s_gamma_inited = false;
 static uint8_t s_gamma_lut[256];
 
+/**
+ * @brief 初始化 Gamma LUT，仅执行一次
+ * @details 这样后面在把流体密度映射到 LED 亮度时，就不用每帧重复做 powf 计算。
+ */
 static void gamma_init_once(void) {
     if (s_gamma_inited)
         return;
@@ -46,6 +50,9 @@ static void gamma_init_once(void) {
     s_gamma_inited = true;
 }
 
+/**
+ * @brief 将整数限制在指定区间
+ */
 static inline int clamp_i(int x, int lo, int hi) {
     if (x < lo)
         return lo;
@@ -53,6 +60,10 @@ static inline int clamp_i(int x, int lo, int hi) {
         return hi;
     return x;
 }
+
+/**
+ * @brief 将浮点数限制在指定区间
+ */
 static inline float clamp_f(float x, float lo, float hi) {
     if (x < lo)
         return lo;
@@ -90,9 +101,14 @@ struct FlipFluid {
     float gravity_scale;
     int push_iters;
     int pressure_iters;
+    // PIC/FLIP 混合权重，越接近 1 越偏向 FLIP，越接近 0 越偏向 PIC
     float flip_ratio;
 };
 
+/**
+ * @brief 对粒子位置和速度做显式积分
+ * @details 先把重力加到速度上，再用速度推进位置。这里用 dsps_addc_f32 批量处理速度分量以提升性能。
+ */
 static void integrate_particles(int n, float* pos, float* vel, float dt,
                                 float gx, float gy) {
     const float dgx = gx * dt;
@@ -105,6 +121,10 @@ static void integrate_particles(int n, float* pos, float* vel, float dt,
     }
 }
 
+/**
+ * @brief 用局部网格把粒子彼此撑开，避免过度重叠
+ * @details 这是 FLIP 粒子阶段常见的“粒子分离”步骤，能减少粒子聚团导致的数值不稳定。
+ */
 static void push_particles_apart(int num_particles, float* pos,
                                  float particle_radius, float p_inv_spacing,
                                  int p_num_x, int p_num_y,
@@ -115,7 +135,7 @@ static void push_particles_apart(int num_particles, float* pos,
     const float min_dist2 = min_dist * min_dist;
     const int p_num_cells = p_num_x * p_num_y;
 
-    // (a) 统计每个网格里有几个粒子
+    // (a) 统计每个辅助网格单元内有多少粒子
     dsps_memset(num_cell_particles, 0, sizeof(int32_t) * p_num_cells);
 
     for (int i = 0; i < num_particles; i++) {
@@ -127,7 +147,7 @@ static void push_particles_apart(int num_particles, float* pos,
         num_cell_particles[cell]++;
     }
 
-    // (b) 前缀和：得到每个 cell 的粒子区间
+    // (b) 前缀和：为每个 cell 计算粒子在 cell_particle_ids 中的存储区间
     int first = 0;
     for (int i = 0; i < p_num_cells; i++) {
         first += num_cell_particles[i];
@@ -135,7 +155,7 @@ static void push_particles_apart(int num_particles, float* pos,
     }
     first_cell_particle[p_num_cells] = first;
 
-    // (c) 把粒子 id 塞到对应 cell 的区间里（倒填）
+    // (c) 按 cell 分桶，把粒子 id 写入连续区间，便于后续只检查邻域粒子
     for (int i = 0; i < num_particles; i++) {
         float x = pos[2 * i + 0];
         float y = pos[2 * i + 1];
@@ -146,7 +166,7 @@ static void push_particles_apart(int num_particles, float* pos,
         cell_particle_ids[first_cell_particle[cell]] = i;
     }
 
-    // (d) 把粒子推开：避免粒子叠在一起
+    // (d) 迭代多次，把彼此距离过近的粒子推开
     for (int it = 0; it < num_iters; it++) {
         for (int i = 0; i < num_particles; i++) {
             float px = pos[2 * i + 0];
@@ -183,6 +203,7 @@ static void push_particles_apart(int num_particles, float* pos,
 
                         float d = 0.0f;
                         dsps_sqrt_f32(&d2, &d, 1);
+                        // 按距离不足的比例对双方各推一半
                         float s = (0.5f * (min_dist - d)) / d;
                         dx *= s;
                         dy *= s;
@@ -198,6 +219,10 @@ static void push_particles_apart(int num_particles, float* pos,
     }
 }
 
+/**
+ * @brief 处理粒子与边界的碰撞
+ * @details 粒子越界后把位置夹回合法范围，并清零对应法向速度，避免穿墙。
+ */
 static void handle_particle_collisions(int n, float* pos, float* vel,
                                        float f_inv_spacing, int f_num_x,
                                        int f_num_y, float particle_radius) {
@@ -235,6 +260,10 @@ static void handle_particle_collisions(int n, float* pos, float* vel,
     }
 }
 
+/**
+ * @brief 统计粒子密度并投影到网格上
+ * @details 把每个粒子的影响按双线性权重撒到周围四个网格点，得到连续的密度场。
+ */
 static void update_particle_density(int num_particles, float* pos,
                                     float* particle_density, int f_num_x,
                                     int f_num_y, float h, float f_inv_spacing) {
@@ -260,7 +289,7 @@ static void update_particle_density(int num_particles, float* pos,
         float sx = 1.0f - tx;
         float sy = 1.0f - ty;
 
-        // 双线性加权累加密度
+        // 双线性加权：粒子对四个邻近网格点的贡献会随距离平滑衰减
         particle_density[x0 * n + y0] += sx * sy;
         particle_density[x1 * n + y0] += tx * sy;
         particle_density[x1 * n + y1] += tx * ty;
@@ -268,6 +297,10 @@ static void update_particle_density(int num_particles, float* pos,
     }
 }
 
+/**
+ * @brief 根据当前网格中的流体单元，估算静止状态下的参考密度
+ * @details 后续做压缩修正时，需要一个基准密度来判断流体是偏稀还是偏密。
+ */
 static float calculate_rest_density(int f_num_cells, const int32_t* cell_type,
                                     const float* particle_density,
                                     int FLUID_CELL) {
@@ -284,6 +317,11 @@ static float calculate_rest_density(int f_num_cells, const int32_t* cell_type,
     return (cnt > 0) ? (sum / (float)cnt) : 0.0f;
 }
 
+/**
+ * @brief 在粒子速度和网格速度之间来回转移数据
+ * @details to_grid=1 时做粒子 -> 网格；to_grid=0 时做网格 -> 粒子。
+ *          这是 FLIP 的核心之一：PIC 提供稳定性，FLIP 保留流体“惯性”和“飘逸感”。
+ */
 static void transfer_velocities(int to_grid, float flip_ratio,
                                 int num_particles, float* pos, float* vel,
                                 float* u, float* v, float* du, float* dv,
@@ -295,6 +333,7 @@ static void transfer_velocities(int to_grid, float flip_ratio,
     const float h2 = 0.5f * h;
 
     if (to_grid) {
+        // 保存上一帧网格速度，供 FLIP 增量恢复使用
         size_t bytes = sizeof(float) * (size_t)f_num_x * (size_t)f_num_y;
         dsps_memcpy(prev_u, u, bytes);
         dsps_memcpy(prev_v, v, bytes);
@@ -303,11 +342,11 @@ static void transfer_velocities(int to_grid, float flip_ratio,
         dsps_memset(u, 0, bytes);
         dsps_memset(v, 0, bytes);
 
-        // 根据固体 s[] 设置 cell_type（边界 SOLID，其它 AIR）
+        // 根据固体标记 s[] 先初始化 cell_type：0 代表空气，边界位置标成固体
         for (int i = 0; i < f_num_x * f_num_y; i++) {
             cell_type[i] = (s[i] == 0.0f) ? SOLID_CELL : AIR_CELL;
         }
-        // 粒子所在 cell -> FLUID
+        // 粒子所在的格子标记为流体单元
         for (int i = 0; i < num_particles; i++) {
             float x = pos[2 * i + 0];
             float y = pos[2 * i + 1];
@@ -319,7 +358,7 @@ static void transfer_velocities(int to_grid, float flip_ratio,
         }
     }
 
-    // 分两次：component=0 处理 u，component=1 处理 v
+    // 分两次转移：component=0 处理 x 方向速度 u，component=1 处理 y 方向速度 v
     for (int component = 0; component < 2; component++) {
         float dx = (component == 0) ? 0.0f : h2;
         float dy = (component == 0) ? h2 : 0.0f;
@@ -358,6 +397,7 @@ static void transfer_velocities(int to_grid, float flip_ratio,
 
             if (to_grid) {
                 float pv = vel[2 * i + component];
+                // 粒子速度按权重累加到周围 4 个网格点
                 f[nr0] += pv * w0;
                 d[nr0] += w0;
                 f[nr1] += pv * w1;
@@ -368,6 +408,7 @@ static void transfer_velocities(int to_grid, float flip_ratio,
                 d[nr3] += w3;
             } else {
                 int offset = (component == 0) ? n : 1;
+                // 只在非空气单元或其相邻非空气单元上做速度回传，避免固体边界把流体速度污染掉
                 float valid0 = (cell_type[nr0] != AIR_CELL ||
                                 cell_type[nr0 - offset] != AIR_CELL)
                                    ? 1.0f
@@ -390,11 +431,13 @@ static void transfer_velocities(int to_grid, float flip_ratio,
                     valid0 * w0 + valid1 * w1 + valid2 * w2 + valid3 * w3;
 
                 if (d_sum > 0.0f) {
+                    // PIC：直接从网格插值速度，稳定但会更“粘”
                     float pic_v =
                         (valid0 * w0 * f[nr0] + valid1 * w1 * f[nr1] +
                          valid2 * w2 * f[nr2] + valid3 * w3 * f[nr3]) /
                         d_sum;
 
+                    // FLIP：恢复速度增量，保留粒子的惯性与流动感
                     float corr = (valid0 * w0 * (f[nr0] - prev_f[nr0]) +
                                   valid1 * w1 * (f[nr1] - prev_f[nr1]) +
                                   valid2 * w2 * (f[nr2] - prev_f[nr2]) +
@@ -409,13 +452,13 @@ static void transfer_velocities(int to_grid, float flip_ratio,
         }
 
         if (to_grid) {
-            // 归一化：
+            // 把累积速度除以权重和，得到网格上的平均速度
             for (int i = 0; i < f_num_x * f_num_y; i++) {
                 if (d[i] > 0.0f)
                     f[i] /= d[i];
             }
 
-            // 固体边界修正
+            // 固体边界修正：固体内部和贴边速度回退到上一帧，防止穿模
             for (int i = 0; i < f_num_x; i++) {
                 for (int j = 0; j < f_num_y; j++) {
                     int idx = i * n + j;
@@ -434,6 +477,10 @@ static void transfer_velocities(int to_grid, float flip_ratio,
     }
 }
 
+/**
+ * @brief 求解不可压缩约束，使流体看起来“装满容器”但不会无规律膨胀
+ * @details 通过多轮压力迭代，把网格速度场的散度压到接近 0。
+ */
 static void solve_incompressibility(
     int num_iters, float dt, float over_relaxation, int compensate_drift,
     float* p, float* u, float* v, float* prev_u, float* prev_v, const float* s,
@@ -446,6 +493,7 @@ static void solve_incompressibility(
     dsps_memcpy(prev_u, u, bytes);
     dsps_memcpy(prev_v, v, bytes);
 
+    // 系数把速度修正量换算成压力修正量
     float cp = (density * h) / dt;
 
     for (int it = 0; it < num_iters; it++) {
@@ -466,9 +514,11 @@ static void solve_incompressibility(
                 if (s_sum == 0.0f)
                     continue;
 
+                // 计算当前单元的散度，散度越大代表越需要压力修正
                 float div = (u[right] - u[center]) + (v[top] - v[center]);
 
                 if (particle_rest_density > 0.0f && compensate_drift) {
+                    // 用粒子密度偏差补偿数值漂移，减少流体“虚胖”或“漏气”
                     float compression =
                         particle_density[center] - particle_rest_density;
                     if (compression > 0.0f) {
@@ -476,10 +526,12 @@ static void solve_incompressibility(
                     }
                 }
 
+                // 由散度推导出压力增量，并用 over_relaxation 加速收敛
                 float p_val = -div / s_sum;
                 p_val *= over_relaxation;
                 p[center] += cp * p_val;
 
+                // 通过压力差修正相邻速度，让流体趋向不可压缩
                 u[center] -= sx0 * p_val;
                 u[right] += sx1 * p_val;
                 v[center] -= sy0 * p_val;
@@ -489,6 +541,10 @@ static void solve_incompressibility(
     }
 }
 
+/**
+ * @brief 把粒子密度转换成可显示的 LED 亮度网格
+ * @details 先将密度归一化，再做 Gamma 校正，最后缩放到 LED 的可用亮度范围。
+ */
 static void get_led_grid(const FlipFluid* f, float* out_grid, int visible_x,
                          int visible_y) {
     const int padding = 1;
@@ -505,7 +561,7 @@ static void get_led_grid(const FlipFluid* f, float* out_grid, int visible_x,
                 d /= f->particle_rest_density;
             }
 
-            // 归一化
+            // 将密度压缩到 0~1 区间，避免亮度过曝
             float b = d / DENSITY_CLAMP_F;
             if (b < 0.0f)
                 b = 0.0f;
@@ -513,13 +569,14 @@ static void get_led_grid(const FlipFluid* f, float* out_grid, int visible_x,
                 b = 1.0f;
 
             uint8_t bi = (uint8_t)lrintf(b * 255.0f);
+            // 用 Gamma LUT 做非线性映射，让显示更接近人眼感知
             uint8_t bg = s_gamma_lut[bi];
             out_grid[i * visible_y + j] = (float)bg * (LED_VAL_MAX_F / 255.0f);
         }
     }
 }
 
-// 对外 API
+// 对外 API：外部只需要调用这些接口即可完成配置和仿真
 void flip_set_gravity_scale(FlipFluid* f, float gravity_scale) {
     if (!f)
         return;
@@ -551,6 +608,9 @@ void flip_set_solver_quality(FlipFluid* f, int push_iters, int pressure_iters,
     f->flip_ratio = flip_ratio;
 }
 
+/**
+ * @brief 申请对齐内存并清零
+ */
 static int alloc_floats(float** p, int count) {
     size_t bytes = (size_t)count * sizeof(float);
     *p = (float*)heap_caps_aligned_alloc(
@@ -561,11 +621,19 @@ static int alloc_floats(float** p, int count) {
     }
     return 0;
 }
+
+/**
+ * @brief 申请整型数组并清零
+ */
 static int alloc_i32(int32_t** p, int count) {
     *p = (int32_t*)calloc((size_t)count, sizeof(int32_t));
     return (*p != NULL);
 }
 
+/**
+ * @brief 创建 FLIP 流体模拟器实例
+ * @details 根据可见分辨率、容器尺寸和填充比例，初始化粒子、网格和边界。
+ */
 FlipFluid* flip_create(float sim_w, float sim_h, int visible_res,
                        float fill_ratio) {
     int sim_res = visible_res + 2;
@@ -616,7 +684,7 @@ FlipFluid* flip_create(float sim_w, float sim_h, int visible_res,
     f->pressure_iters = 12;
     f->flip_ratio = 0.9f;
 
-    // 分配内存
+    // 分配各类网格、粒子和辅助索引缓存
     if (!alloc_floats(&f->u, f->f_num_cells) ||
         !alloc_floats(&f->v, f->f_num_cells) ||
         !alloc_floats(&f->du, f->f_num_cells) ||
@@ -635,7 +703,7 @@ FlipFluid* flip_create(float sim_w, float sim_h, int visible_res,
         flip_destroy(f);
         return NULL;
     }
-    // 初始化
+    // 初始化粒子：按六边形紧密堆叠方式填充水体区域
     f->num_particles = num_x * num_y;
     int p_idx = 0;
     for (int i = 0; i < num_x; i++) {
@@ -651,6 +719,7 @@ FlipFluid* flip_create(float sim_w, float sim_h, int visible_res,
     for (int i = 0; i < f->f_num_x; i++) {
         for (int j = 0; j < f->f_num_y; j++) {
             float ss = 1.0f;
+            // 四周边界设为固体，内部设为可流动区域
             if (i == 0 || i == f->f_num_x - 1 || j == 0 ||
                 j == f->f_num_y - 1) {
                 ss = 0.0f;
@@ -661,11 +730,15 @@ FlipFluid* flip_create(float sim_w, float sim_h, int visible_res,
 
     f->particle_rest_density = 0.0f;
 
+    // 初始化 Gamma 查找表，后续渲染会直接复用
     gamma_init_once();
 
     return f;
 }
 
+/**
+ * @brief 销毁 FLIP 实例并释放所有资源
+ */
 void flip_destroy(FlipFluid* f) {
     if (!f)
         return;
@@ -687,6 +760,10 @@ void flip_destroy(FlipFluid* f) {
     free(f);
 }
 
+/**
+ * @brief 推进一次流体仿真
+ * @details 包括粒子积分、粒子分离、边界碰撞、粒子/网格速度转移、密度更新和压力求解。
+ */
 void flip_step(FlipFluid* f, float dt, float gx, float gy) {
     if (!f)
         return;
@@ -734,6 +811,10 @@ void flip_step(FlipFluid* f, float dt, float gx, float gy) {
                         f->AIR_CELL, f->FLUID_CELL, f->SOLID_CELL);
 }
 
+/**
+ * @brief 生成 LED 显示用的网格数据
+ * @details 外部渲染层调用这个函数即可把流体密度转换成点阵亮度。
+ */
 void flip_get_led_grid(const FlipFluid* f, float* out_grid) {
     if (!f || !out_grid)
         return;

@@ -30,20 +30,27 @@ Modifications/port to C:
 #define DENSITY_CLAMP_F 1.2f
 #define GAMMA_F 0.6f
 
-// gamma LUT
+// 伽马校正查找表 (LUT)，用于优化 LED 亮度感知
 static bool s_gamma_inited = false;
 static uint8_t s_gamma_lut[256];
 
+/**
+ * @brief 初始化伽马校正查找表
+ * 
+ * LED 的物理亮度与人眼感知的亮度不是线性的，通过 gamma 校正使视觉过渡更平滑。
+ */
 static void gamma_init_once(void) {
     if (s_gamma_inited)
         return;
     for (int i = 0; i < 256; i++) {
         float x = (float)i / 255.0f;
+        // 使用 powf 进行伽马变换，输出范围 0-255
         s_gamma_lut[i] = (uint8_t)lrintf(powf(x, GAMMA_F) * 255.0f);
     }
     s_gamma_inited = true;
 }
 
+// 整数钳位函数
 static inline int clamp_i(int x, int lo, int hi) {
     if (x < lo)
         return lo;
@@ -51,6 +58,7 @@ static inline int clamp_i(int x, int lo, int hi) {
         return hi;
     return x;
 }
+// 浮点数钳位函数
 static inline float clamp_f(float x, float lo, float hi) {
     if (x < lo)
         return lo;
@@ -59,52 +67,66 @@ static inline float clamp_f(float x, float lo, float hi) {
     return x;
 }
 
+/**
+ * @brief FLIP 流体仿真结构体
+ * 
+ * 包含了流体网格数据（速度场、压力场）以及拉格朗日粒子数据。
+ */
 struct FlipFluid {
-    float density;
-    int f_num_x, f_num_y;
-    float h;
-    float f_inv_spacing;
-    int f_num_cells;
+    float density;              // 流体密度
+    int f_num_x, f_num_y;       // 网格维度
+    float h;                    // 网格单元大小
+    float f_inv_spacing;        // 网格间距倒数 (1/h)
+    int f_num_cells;            // 总网格数
 
+    // 网格场：u(x速度), v(y速度), du/dv(速度变化量), prev_u/v(前一帧速度), p(压力), s(固体标识)
     float *u, *v, *du, *dv, *prev_u, *prev_v, *p, *s;
-    int32_t* cell_type;
+    int32_t* cell_type;         // 网格类型 (AIR/FLUID/SOLID)
 
-    int max_particles;
-    int num_particles;
-    float* particle_pos;
-    float* particle_vel;
-    float* particle_density;
-    float particle_rest_density;
+    int max_particles;          // 最大粒子数
+    int num_particles;          // 当前粒子数
+    float* particle_pos;        // 粒子位置 (x,y 交替存储)
+    float* particle_vel;        // 粒子速度 (vx,vy 交替存储)
+    float* particle_density;    // 粒子在网格位置的重构密度
+    float particle_rest_density;// 粒子的静止密度（初始参考值）
 
-    float particle_radius;
-    float p_inv_spacing;
-    int p_num_x, p_num_y, p_num_cells;
-    int32_t* num_cell_particles;
-    int32_t* first_cell_particle;
-    int32_t* cell_particle_ids;
+    float particle_radius;      // 粒子半径
+    float p_inv_spacing;        // 搜索网格间距倒数
+    int p_num_x, p_num_y, p_num_cells; // 空间 Hash 网格维度
+    int32_t* num_cell_particles;  // 每个 cell 里的粒子数量统计
+    int32_t* first_cell_particle; // 前缀和，记录每个 cell 粒子 ID 的起始索引
+    int32_t* cell_particle_ids;   // 排序后的粒子 ID 列表
 
-    int AIR_CELL, FLUID_CELL, SOLID_CELL;
+    int AIR_CELL, FLUID_CELL, SOLID_CELL; // 常量定义
 
-    float gravity_scale;
-    int push_iters;
-    int pressure_iters;
-    float flip_ratio;
+    float gravity_scale;        // 重力比例
+    int push_iters;             // 粒子推开迭代次数
+    int pressure_iters;         // 压力求解迭代次数
+    float flip_ratio;           // FLIP 与 PIC 的混合比例 (通常 0.9)
 };
 
 void flip_without_dsps_destroy(FlipFluid* f);
 
+/**
+ * @brief 粒子积分：更新位置和速度（前向欧拉法）
+ */
 static void integrate_particles(int n, float* pos, float* vel, float dt,
                                 float gx, float gy) {
     const float dgx = gx * dt;
     const float dgy = gy * dt;
     for (int i = 0; i < n; i++) {
-        vel[2 * i + 0] += dgx;
-        vel[2 * i + 1] += dgy;
-        pos[2 * i + 0] += vel[2 * i + 0] * dt;
-        pos[2 * i + 1] += vel[2 * i + 1] * dt;
+        vel[2 * i + 0] += dgx; // vx += ax * dt
+        vel[2 * i + 1] += dgy; // vy += ay * dt
+        pos[2 * i + 0] += vel[2 * i + 0] * dt; // x += vx * dt
+        pos[2 * i + 1] += vel[2 * i + 1] * dt; // y += vy * dt
     }
 }
 
+/**
+ * @brief 粒子互斥处理：通过空间网格加速，将重叠的粒子推开
+ * 
+ * 这是一个典型的单元网格碰撞检测算法。
+ */
 static void push_particles_apart(int num_particles, float* pos,
                                  float particle_radius, float p_inv_spacing,
                                  int p_num_x, int p_num_y,
@@ -127,26 +149,30 @@ static void push_particles_apart(int num_particles, float* pos,
         num_cell_particles[cell]++;
     }
 
-    // (b) 前缀和：得到每个 cell 的粒子区间
+    // (b) 计算前缀和：确定每个 cell 在 cell_particle_ids 中的存储区间
     int first = 0;
     for (int i = 0; i < p_num_cells; i++) {
-        first += num_cell_particles[i];
+        int count = num_cell_particles[i];
         first_cell_particle[i] = first;
+        first += count;
     }
     first_cell_particle[p_num_cells] = first;
 
-    // (c) 把粒子 id 塞到对应 cell 的区间里（倒填）
+    // (c) 填充粒子 ID 列表
+    // 拷贝一份起始索引，用于填充
+    int32_t* temp_offsets = (int32_t*)malloc(sizeof(int32_t) * p_num_cells);
+    memcpy(temp_offsets, first_cell_particle, sizeof(int32_t) * p_num_cells);
     for (int i = 0; i < num_particles; i++) {
         float x = pos[2 * i + 0];
         float y = pos[2 * i + 1];
         int xi = clamp_i((int)(x * p_inv_spacing), 0, p_num_x - 1);
         int yi = clamp_i((int)(y * p_inv_spacing), 0, p_num_y - 1);
         int cell = xi * p_num_y + yi;
-        first_cell_particle[cell]--;
-        cell_particle_ids[first_cell_particle[cell]] = i;
+        cell_particle_ids[temp_offsets[cell]++] = i;
     }
+    free(temp_offsets);
 
-    // (d) 把粒子推开：避免粒子叠在一起
+    // (d) 迭代执行推开逻辑：处理粒子间的碰撞/排斥
     for (int it = 0; it < num_iters; it++) {
         for (int i = 0; i < num_particles; i++) {
             float px = pos[2 * i + 0];
@@ -155,6 +181,7 @@ static void push_particles_apart(int num_particles, float* pos,
             int pxi = (int)(px * p_inv_spacing);
             int pyi = (int)(py * p_inv_spacing);
 
+            // 检查周围 3x3 的网格
             int x0 = MAX(pxi - 1, 0);
             int y0 = MAX(pyi - 1, 0);
             int x1 = MIN(pxi + 1, p_num_x - 1);
@@ -168,8 +195,7 @@ static void push_particles_apart(int num_particles, float* pos,
 
                     for (int k = a; k < b; k++) {
                         int id = cell_particle_ids[k];
-                        if (id == i)
-                            continue;
+                        if (id == i) continue; // 跳过自己
 
                         float qx = pos[2 * id + 0];
                         float qy = pos[2 * id + 1];
@@ -178,6 +204,7 @@ static void push_particles_apart(int num_particles, float* pos,
                         float dy = qy - py;
                         float d2 = dx * dx + dy * dy;
 
+                        // 如果距离小于直径，则推开
                         if (d2 > min_dist2 || d2 == 0.0f)
                             continue;
 
@@ -197,6 +224,9 @@ static void push_particles_apart(int num_particles, float* pos,
     }
 }
 
+/**
+ * @brief 处理粒子与固体边界（容器壁）的碰撞
+ */
 static void handle_particle_collisions(int n, float* pos, float* vel,
                                        float f_inv_spacing, int f_num_x,
                                        int f_num_y, float particle_radius) {
@@ -234,20 +264,28 @@ static void handle_particle_collisions(int n, float* pos, float* vel,
     }
 }
 
+/**
+ * @brief 更新网格中的粒子密度
+ * 
+ * 将粒子的质量（这里简化为常数权重）通过双线性插值映射到网格节点。
+ */
 static void update_particle_density(int num_particles, float* pos,
                                     float* particle_density, int f_num_x,
                                     int f_num_y, float h, float f_inv_spacing) {
     const int n = f_num_y;
     const float h2 = 0.5f * h;
+    // 重置密度网格
     memset(particle_density, 0, sizeof(float) * (f_num_x * f_num_y));
 
     for (int i = 0; i < num_particles; i++) {
         float x = pos[2 * i + 0];
         float y = pos[2 * i + 1];
 
+        // 钳位在仿真范围内
         x = clamp_f(x, h, (f_num_x - 1) * h);
         y = clamp_f(y, h, (f_num_y - 1) * h);
 
+        // 计算网格坐标和插值权重
         int x0 = (int)((x - h2) * f_inv_spacing);
         float tx = (x - h2 - x0 * h) * f_inv_spacing;
         int x1 = MIN(x0 + 1, f_num_x - 2);
@@ -259,7 +297,7 @@ static void update_particle_density(int num_particles, float* pos,
         float sx = 1.0f - tx;
         float sy = 1.0f - ty;
 
-        // 双线性加权累加密度
+        // 将粒子权重分配给相邻的 4 个网格点 (双线性插值)
         particle_density[x0 * n + y0] += sx * sy;
         particle_density[x1 * n + y0] += tx * sy;
         particle_density[x1 * n + y1] += tx * ty;
@@ -267,22 +305,31 @@ static void update_particle_density(int num_particles, float* pos,
     }
 }
 
+/**
+ * @brief 计算静止密度 (Rest Density)
+ * 
+ * 在仿真初期的稳定状态下，计算所有流体单元密度的平均值，作为后续压力求解的参考。
+ */
 static float calculate_rest_density(int f_num_cells, const int32_t* cell_type,
                                     const float* particle_density,
                                     int FLUID_CELL) {
     float sum = 0.0f;
-    for (int i = 0; i < f_num_cells; i++) {
-        sum += particle_density[i];
-    }
     int cnt = 0;
     for (int i = 0; i < f_num_cells; i++) {
         if (cell_type[i] == FLUID_CELL) {
+            sum += particle_density[i];
             cnt++;
         }
     }
     return (cnt > 0) ? (sum / (float)cnt) : 0.0f;
 }
 
+/**
+ * @brief 核心函数：粒子与网格间的速度传输 (Transfer)
+ * 
+ * @param to_grid 为 1 时：将粒子速度映射到网格 (Gathering)
+ * @param to_grid 为 0 时：将网格速度回插到粒子 (Scattering)，支持 PIC/FLIP 混合
+ */
 static void transfer_velocities(int to_grid, float flip_ratio,
                                 int num_particles, float* pos, float* vel,
                                 float* u, float* v, float* du, float* dv,
@@ -294,19 +341,20 @@ static void transfer_velocities(int to_grid, float flip_ratio,
     const float h2 = 0.5f * h;
 
     if (to_grid) {
+        // --- 粒子 -> 网格 ---
         size_t bytes = sizeof(float) * (size_t)f_num_x * (size_t)f_num_y;
         memcpy(prev_u, u, bytes);
         memcpy(prev_v, v, bytes);
-        memset(du, 0, bytes);
+        memset(du, 0, bytes); // 这里用 du/dv 临时存储权重和
         memset(dv, 0, bytes);
         memset(u, 0, bytes);
         memset(v, 0, bytes);
 
-        // 根据固体 s[] 设置 cell_type（边界 SOLID，其它 AIR）
+        // 1. 根据固体 s[] 设置网格类型（1.0 可通行，0.0 为固体边界）
         for (int i = 0; i < f_num_x * f_num_y; i++) {
             cell_type[i] = (s[i] == 0.0f) ? SOLID_CELL : AIR_CELL;
         }
-        // 粒子所在 cell -> FLUID
+        // 2. 标记有粒子的单元为流体
         for (int i = 0; i < num_particles; i++) {
             float x = pos[2 * i + 0];
             float y = pos[2 * i + 1];
@@ -318,14 +366,14 @@ static void transfer_velocities(int to_grid, float flip_ratio,
         }
     }
 
-    // 分两次：component=0 处理 u，component=1 处理 v
+    // 处理 u 和 v 两个速度分量 (Staggered Grid)
     for (int component = 0; component < 2; component++) {
         float dx = (component == 0) ? 0.0f : h2;
         float dy = (component == 0) ? h2 : 0.0f;
 
         float* f = (component == 0) ? u : v;
         float* prev_f = (component == 0) ? prev_u : prev_v;
-        float* d = (component == 0) ? du : dv;
+        float* weight_grid = (component == 0) ? du : dv;
 
         for (int i = 0; i < num_particles; i++) {
             float x = pos[2 * i + 0];
@@ -345,86 +393,65 @@ static void transfer_velocities(int to_grid, float flip_ratio,
             float sx = 1.0f - tx;
             float sy = 1.0f - ty;
 
-            float w0 = sx * sy;
-            float w1 = tx * sy;
-            float w2 = tx * ty;
-            float w3 = sx * ty;
+            float w0 = sx * sy; float w1 = tx * sy;
+            float w2 = tx * ty; float w3 = sx * ty;
 
-            int nr0 = x0 * n + y0;
-            int nr1 = x1 * n + y0;
-            int nr2 = x1 * n + y1;
-            int nr3 = x0 * n + y1;
+            int nr0 = x0 * n + y0; int nr1 = x1 * n + y0;
+            int nr2 = x1 * n + y1; int nr3 = x0 * n + y1;
 
             if (to_grid) {
+                // 累加速度到网格
                 float pv = vel[2 * i + component];
-                f[nr0] += pv * w0;
-                d[nr0] += w0;
-                f[nr1] += pv * w1;
-                d[nr1] += w1;
-                f[nr2] += pv * w2;
-                d[nr2] += w2;
-                f[nr3] += pv * w3;
-                d[nr3] += w3;
+                f[nr0] += pv * w0; weight_grid[nr0] += w0;
+                f[nr1] += pv * w1; weight_grid[nr1] += w1;
+                f[nr2] += pv * w2; weight_grid[nr2] += w2;
+                f[nr3] += pv * w3; weight_grid[nr3] += w3;
             } else {
+                // --- 网格 -> 粒子 (双线性回插) ---
                 int offset = (component == 0) ? n : 1;
-                float valid0 = (cell_type[nr0] != AIR_CELL ||
-                                cell_type[nr0 - offset] != AIR_CELL)
-                                   ? 1.0f
-                                   : 0.0f;
-                float valid1 = (cell_type[nr1] != AIR_CELL ||
-                                cell_type[nr1 - offset] != AIR_CELL)
-                                   ? 1.0f
-                                   : 0.0f;
-                float valid2 = (cell_type[nr2] != AIR_CELL ||
-                                cell_type[nr2 - offset] != AIR_CELL)
-                                   ? 1.0f
-                                   : 0.0f;
-                float valid3 = (cell_type[nr3] != AIR_CELL ||
-                                cell_type[nr3 - offset] != AIR_CELL)
-                                   ? 1.0f
-                                   : 0.0f;
+                // 检查网格节点是否有效（非空气）
+                float valid0 = (cell_type[nr0] != AIR_CELL || cell_type[nr0 - offset] != AIR_CELL) ? 1.0f : 0.0f;
+                float valid1 = (cell_type[nr1] != AIR_CELL || cell_type[nr1 - offset] != AIR_CELL) ? 1.0f : 0.0f;
+                float valid2 = (cell_type[nr2] != AIR_CELL || cell_type[nr2 - offset] != AIR_CELL) ? 1.0f : 0.0f;
+                float valid3 = (cell_type[nr3] != AIR_CELL || cell_type[nr3 - offset] != AIR_CELL) ? 1.0f : 0.0f;
 
                 float v_curr = vel[2 * i + component];
-                float d_sum =
-                    valid0 * w0 + valid1 * w1 + valid2 * w2 + valid3 * w3;
+                float d_sum = valid0 * w0 + valid1 * w1 + valid2 * w2 + valid3 * w3;
 
                 if (d_sum > 0.0f) {
-                    float pic_v =
-                        (valid0 * w0 * f[nr0] + valid1 * w1 * f[nr1] +
-                         valid2 * w2 * f[nr2] + valid3 * w3 * f[nr3]) /
-                        d_sum;
+                    // PIC 方法：直接插值新速度
+                    float pic_v = (valid0 * w0 * f[nr0] + valid1 * w1 * f[nr1] +
+                                   valid2 * w2 * f[nr2] + valid3 * w3 * f[nr3]) / d_sum;
 
+                    // FLIP 方法：将变化的差值累加到原速度
                     float corr = (valid0 * w0 * (f[nr0] - prev_f[nr0]) +
                                   valid1 * w1 * (f[nr1] - prev_f[nr1]) +
                                   valid2 * w2 * (f[nr2] - prev_f[nr2]) +
-                                  valid3 * w3 * (f[nr3] - prev_f[nr3])) /
-                                 d_sum;
+                                  valid3 * w3 * (f[nr3] - prev_f[nr3])) / d_sum;
 
                     float flip_v = v_curr + corr;
-                    vel[2 * i + component] =
-                        (1.0f - flip_ratio) * pic_v + flip_ratio * flip_v;
+                    // 混合 PIC 和 FLIP (通常 flip_ratio=0.9)
+                    vel[2 * i + component] = (1.0f - flip_ratio) * pic_v + flip_ratio * flip_v;
                 }
             }
         }
 
         if (to_grid) {
-            // 归一化：
+            // 归一化网格速度 (除以权重总和)
             for (int i = 0; i < f_num_x * f_num_y; i++) {
-                if (d[i] > 0.0f)
-                    f[i] /= d[i];
+                if (weight_grid[i] > 0.0f)
+                    f[i] /= weight_grid[i];
             }
 
-            // 固体边界修正
+            // 恢复/保持固体边界的速度值 (通常为零或设定值)
             for (int i = 0; i < f_num_x; i++) {
                 for (int j = 0; j < f_num_y; j++) {
                     int idx = i * n + j;
                     int is_solid = (cell_type[idx] == SOLID_CELL);
-                    if (is_solid ||
-                        (i > 0 && cell_type[(i - 1) * n + j] == SOLID_CELL)) {
+                    if (is_solid || (i > 0 && cell_type[(i - 1) * n + j] == SOLID_CELL)) {
                         u[idx] = prev_u[idx];
                     }
-                    if (is_solid ||
-                        (j > 0 && cell_type[i * n + (j - 1)] == SOLID_CELL)) {
+                    if (is_solid || (j > 0 && cell_type[i * n + (j - 1)] == SOLID_CELL)) {
                         v[idx] = prev_v[idx];
                     }
                 }
@@ -433,6 +460,12 @@ static void transfer_velocities(int to_grid, float flip_ratio,
     }
 }
 
+/**
+ * @brief 压力求解器：使流体满足不可压缩性 (Divergence-free)
+ * 
+ * 使用 Gauss-Seidel 迭代法求解 Pressure Projection。
+ * 同时包含了偏移补偿 (Drift Compensation) 以维持粒子分布。
+ */
 static void solve_incompressibility(
     int num_iters, float dt, float over_relaxation, int compensate_drift,
     float* p, float* u, float* v, float* prev_u, float* prev_v, const float* s,
