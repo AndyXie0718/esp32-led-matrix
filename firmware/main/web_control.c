@@ -28,6 +28,7 @@
 #define WIFI_NVS_NS "wifi_sta"
 #define WIFI_NVS_KEY_SSID "ssid"
 #define WIFI_NVS_KEY_PASS "pass"
+#define WIFI_NVS_KEY_OFFLINE "offline"
 #define CHAT_API_URL "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 #define CHAT_MAX_REQUEST_BODY 32768
 #define CHAT_MAX_API_KEY_LEN 192
@@ -40,6 +41,7 @@ static char s_sta_ssid[33] = {0};
 static char s_sta_ip[16] = {0};
 static char s_sta_pass[65] = {0};
 static bool s_wifi_only_mode = false;
+static bool s_offline_mode = true;
 static sim_mode_t s_resume_mode = SIM_MODE_WATER;
 static esp_netif_t* s_ap_netif = NULL;
 static esp_netif_t* s_sta_netif = NULL;
@@ -192,12 +194,30 @@ static esp_err_t load_sta_credentials(char* ssid, size_t ssid_len, char* pass, s
     if (err == ESP_OK) {
         err = nvs_get_str(handle, WIFI_NVS_KEY_PASS, pass, &pass_size);
     }
+    
+    uint8_t offline = 0;
+    nvs_get_u8(handle, WIFI_NVS_KEY_OFFLINE, &offline);
+    s_offline_mode = (offline != 0);
 
     nvs_close(handle);
 
     if (err == ESP_OK && ssid[0] != '\0') {
         *has_data = true;
     }
+    return err;
+}
+
+static esp_err_t save_offline_mode(bool offline) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WIFI_NVS_NS, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u8(handle, WIFI_NVS_KEY_OFFLINE, offline ? 1 : 0);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
     return err;
 }
 
@@ -367,7 +387,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         s_sta_ip[0] = '\0';
         set_nat_enabled(false);
         ESP_LOGW(TAG, "STA disconnected, reason=%d", e ? (int)e->reason : -1);
-        if (s_sta_ssid[0] != '\0') {
+        if (s_sta_ssid[0] != '\0' && !s_offline_mode) {
             esp_wifi_connect();
         }
     }
@@ -384,6 +404,17 @@ static esp_err_t chat_post_handler(httpd_req_t* req) {
         return ESP_OK;
     }
 
+    char chat_url[256] = {0};
+    strlcpy(chat_url, CHAT_API_URL, sizeof(chat_url));
+    if (read_header_value(req, "X-Chat-Api-Url", chat_url, sizeof(chat_url))) {
+        ESP_LOGI(TAG, "chat upstream url=%s", chat_url);
+    }
+
+    char chat_model[64] = {0};
+    if (read_header_value(req, "X-Chat-Model", chat_model, sizeof(chat_model))) {
+        ESP_LOGI(TAG, "chat upstream model=%s", chat_model);
+    }
+
     char* body = NULL;
     size_t body_len = 0;
     esp_err_t err = read_request_body(req, CHAT_MAX_REQUEST_BODY, &body, &body_len);
@@ -393,9 +424,9 @@ static esp_err_t chat_post_handler(httpd_req_t* req) {
     ESP_LOGI(TAG, "chat request: %.*s", (int)((body_len > 256) ? 256 : body_len), body);
 
     esp_http_client_config_t config = {
-        .url = CHAT_API_URL,
+        .url = chat_url,
         .method = HTTP_METHOD_POST,
-        .transport_type = HTTP_TRANSPORT_OVER_SSL,
+        .transport_type = HTTP_TRANSPORT_UNKNOWN,
         .timeout_ms = 480000,
         .buffer_size = 1024,
         .buffer_size_tx = 1024,
@@ -575,6 +606,7 @@ static const char s_index_html[] =
     "<div class='row'><label style='width:68px'>SSID</label><input id='wifi-ssid' type='text' placeholder='router ssid'></div>"
     "<div class='row'><label style='width:68px'>PASS</label><input id='wifi-pass' type='password' placeholder='router password'></div>"
     "<div class='row'><label style='width:68px'>Mode</label><label class='checkline'><input id='wifi-only' type='checkbox'>WiFi only</label></div>"
+    "<div class='row'><label style='width:68px'></label><label class='checkline'><input id='wifi-offline' type='checkbox'>Offline</label></div>"
     "</div>"
     "<div style='display:flex;flex-direction:column;gap:8px'>"
     "<button id='wifi-connect' class='alt'>Connect STA</button>"
@@ -591,23 +623,26 @@ static const char s_index_html[] =
     "<div id='grid'></div>"
     "<button id='apply'>Confirm Pattern</button>"
     "<div class='chat-card'>"
-    "<div class='chat-head'><div>AI Chat</div><div class='chat-meta'>glm-4.7-flash via device proxy</div></div>"
+    "<div class='chat-head'><div>AI Chat</div><div class='chat-meta'>Chat config via device proxy</div></div>"
+    "<div class='row'><label style='width:68px'>URL</label><input id='chat-api-url' type='text' value='" CHAT_API_URL "' placeholder='chat-api-url'></div>"
+    "<div class='row'><label style='width:68px'>Model</label><input id='chat-api-model' type='text' value='glm-4.7-flash' placeholder='model-name'></div>"
     "<div class='row'><label style='width:68px'>Key</label><input id='chat-api-key' type='password' placeholder='your-api-key'></div>"
     "<div class='chat-actions'>"
-    "<button id='chat-save-key' class='alt' type='button'>Save Key</button>"
+    "<button id='chat-save-config' class='alt' type='button'>Save Chat Config</button>"
+    "<button id='chat-rst-config' class='alt' type='button'>RST</button>"
     "<button id='chat-clear' class='alt' type='button'>Clear Chat</button>"
     "</div>"
     "<div id='chat-log' class='chat-log' aria-live='polite'></div>"
     "<textarea id='chat-input' class='chat-input' placeholder='输入消息，Enter 发送，Shift+Enter 换行'></textarea>"
     "<div class='chat-actions' style='justify-content:space-between;align-items:center'>"
-    "<div class='chat-tip'>消息会先发送到设备，再由设备代理到智谱开放平台。</div>"
+    "<div class='chat-tip'>消息会先发送到设备，再由设备代理到你配置的 Chat API。</div>"
     "<button id='chat-send' class='chat-send' type='button'>发送</button>"
     "</div>"
     "</div>"
     "<div id='msg'></div></div></main>"
     "<script>"
-    "const W=8,H=8;const state={mode:'water',grid:Array(W*H).fill(0),r8:255,g8:255,b8:255,color:'#ffffff',sta_connected:false,sta_ssid:'',sta_ip:'',wifi_only:false};"
-    "const chatState={messages:[],busy:false};const chatStorageKey='glm_api_key';const chatModel='glm-4.7-flash';const chatMaxHistory=16;"
+    "const W=8,H=8;const state={mode:'water',grid:Array(W*H).fill(0),r8:255,g8:255,b8:255,color:'#ffffff',sta_connected:false,sta_ssid:'',sta_ip:'',wifi_only:false,offline_mode:false};"
+    "const chatState={messages:[],busy:false};const chatStorageKey='chat_config';const chatDefaultUrl='" CHAT_API_URL "';const chatDefaultModel='glm-4.7-flash';const chatMaxHistory=16;let wifiStateRetry=0;const wifiStateRetryMax=15;"
     "const chatSystemPrompt='你是ESP32灯板内置AI。仅当用户明确问你是谁/你的身份时，才回答“我是ESP32灯板内置AI”。你可以调整灯的颜色、切换模式（fire/water/custom）、使用8x8画板自动绘画。请不要输出markdown代码块。若需要驱动灯板，请输出严格JSON，格式为{\"reply\":\"给用户看的自然语言回答\",\"control\":{\"mode\":\"fire|water|custom\",\"color\":\"#RRGGBB\",\"bitmap\":\"64位0/1字符串\"}}。模式切换指令仅在用户明确提到颜色时再返回color。没有控制动作时control设为null。';"
     "const APPLE_BITMAP='0001100000111100011111101111111111111111011111100011110000011000';"
         "function setGridEnabled(enabled){document.querySelectorAll('#grid .cell').forEach(el=>{el.disabled=!enabled;});document.getElementById('grid').style.opacity=enabled?'1':'0.45';}"
@@ -617,17 +652,21 @@ static const char s_index_html[] =
     "const toHex=v=>v.toString(16).padStart(2,'0');"
     "function syncColorHex(){state.color='#'+toHex(state.r8)+toHex(state.g8)+toHex(state.b8);}"
     "function hexToRgb(hex){const m=/^#?([a-fA-F0-9]{6})$/.exec(hex||'');if(!m)return null;const s=m[1];return {r:parseInt(s.slice(0,2),16),g:parseInt(s.slice(2,4),16),b:parseInt(s.slice(4,6),16)};}"
-    "function updateWifiStatus(){const el=document.getElementById('wifi-status');if(state.sta_connected){el.textContent='STA: connected to '+(state.sta_ssid||'?')+' , IP='+ (state.sta_ip||'?');}else if(state.sta_ssid){el.textContent='STA: connecting/disconnected ('+state.sta_ssid+')';}else{el.textContent='STA: idle';}}"
+    "function updateWifiStatus(){const el=document.getElementById('wifi-status');if(state.offline_mode){el.textContent='STA: Offline (Disabled)';}else if(state.sta_connected){el.textContent='STA: connected to '+(state.sta_ssid||'?')+' , IP='+ (state.sta_ip||'?');}else if(state.sta_ssid){el.textContent='STA: connecting/disconnected ('+state.sta_ssid+')';}else{el.textContent='STA: idle';}}"
     "function syncColorInputs(){syncColorHex();document.getElementById('color-picker').value=state.color;}"
     "function updatePreview(){const r=state.r8,g=state.g8,b=state.b8;document.getElementById('preview').style.background='linear-gradient(135deg, rgb('+r+','+g+','+b+'), rgb('+Math.min(255,r+30)+','+Math.min(255,g+30)+','+Math.min(255,b+30)+'))';}"
     "function readColorInputs(){const rgb=hexToRgb(document.getElementById('color-picker').value);if(!rgb)return;state.r8=clamp8(rgb.r);state.g8=clamp8(rgb.g);state.b8=clamp8(rgb.b);syncColorInputs();updatePreview();}"
     "function setModeBtn(){['fire','water','custom'].forEach(m=>{const b=document.getElementById('mode-'+m);b.classList.toggle('active',state.mode===m);});}"
     "function makeGrid(){const g=document.getElementById('grid');g.innerHTML='';for(let y=0;y<H;y++){for(let x=0;x<W;x++){const i=y*W+x;const d=document.createElement('button');d.type='button';d.className='cell'+(state.grid[i]?' on':'');d.onclick=()=>{if(state.wifi_only)return;state.grid[i]=state.grid[i]?0:1;d.className='cell'+(state.grid[i]?' on':'');};g.appendChild(d);}}setGridEnabled(!state.wifi_only);}"
-    "function loadChatKey(){try{const saved=localStorage.getItem(chatStorageKey)||'';if(saved){document.getElementById('chat-api-key').value=saved;}}catch(e){}}"
-    "function saveChatKey(){const key=document.getElementById('chat-api-key').value.trim();try{if(key){localStorage.setItem(chatStorageKey,key);}else{localStorage.removeItem(chatStorageKey);}}catch(e){}msg(key?'api key saved':'api key cleared');}"
+    "function getChatConfig(){const urlInput=document.getElementById('chat-api-url');const modelInput=document.getElementById('chat-api-model');const keyInput=document.getElementById('chat-api-key');return {url:(urlInput&&urlInput.value.trim())||chatDefaultUrl,model:(modelInput&&modelInput.value.trim())||chatDefaultModel,key:(keyInput&&keyInput.value.trim())||''};}"
+    "function updateChatMeta(){const meta=document.querySelector('.chat-meta');if(meta){const cfg=getChatConfig();meta.textContent=cfg.model+' via device proxy';}}"
+    "function loadChatConfig(){try{const raw=localStorage.getItem(chatStorageKey)||'';const saved=raw?JSON.parse(raw):{};document.getElementById('chat-api-url').value=(saved.url&&String(saved.url).trim())||chatDefaultUrl;document.getElementById('chat-api-model').value=(saved.model&&String(saved.model).trim())||chatDefaultModel;document.getElementById('chat-api-key').value=saved.key||'';}catch(e){document.getElementById('chat-api-url').value=chatDefaultUrl;document.getElementById('chat-api-model').value=chatDefaultModel;document.getElementById('chat-api-key').value='';}updateChatMeta();}"
+    "function persistChatConfig(cfg){try{localStorage.setItem(chatStorageKey,JSON.stringify(cfg));}catch(e){}}"
+    "function saveChatConfig(){const cfg=getChatConfig();persistChatConfig(cfg);updateChatMeta();msg('chat config saved');}"
+    "function resetChatConfig(){try{localStorage.removeItem(chatStorageKey);}catch(e){}document.getElementById('chat-api-url').value=chatDefaultUrl;document.getElementById('chat-api-model').value=chatDefaultModel;document.getElementById('chat-api-key').value='';updateChatMeta();msg('chat config reset');}"
     "function appendChatBubble(role,text){const log=document.getElementById('chat-log');const item=document.createElement('div');item.className='bubble '+role;item.textContent=text;log.appendChild(item);log.scrollTop=log.scrollHeight;return item;}"
     "function pruneChatHistory(){if(chatState.messages.length>chatMaxHistory){chatState.messages.splice(0,chatState.messages.length-chatMaxHistory);}}"
-    "function initChatLog(){const log=document.getElementById('chat-log');log.innerHTML='';appendChatBubble('system','输入 API Key 后即可对话。');}"
+    "function initChatLog(){const log=document.getElementById('chat-log');log.innerHTML='';appendChatBubble('system','填写 URL / Model / Key 后即可对话。');}"
     "function clearChat(){chatState.messages=[];initChatLog();msg('chat cleared');}"
     "function extractFirstJsonObject(text){let start=-1;let depth=0;let inStr=false;let esc=false;for(let i=0;i<text.length;i++){const ch=text[i];if(inStr){if(esc){esc=false;}else if(ch==='\\\\'){esc=true;}else if(ch==='\"'){inStr=false;}continue;}if(ch==='\"'){inStr=true;continue;}if(ch==='{'){if(depth===0)start=i;depth++;continue;}if(ch==='}'){if(depth>0){depth--;if(depth===0&&start>=0){return text.slice(start,i+1);}}}}return '';}"
     "function stripMarkdownJsonFences(text){return String(text||'').replace(/```json[\\s\\S]*?```/gi,'').replace(/```[\\s\\S]*?```/g,'').trim();}"
@@ -640,24 +679,29 @@ static const char s_index_html[] =
     "async function applyPattern(fromAi){const bitmap=state.grid.map(v=>v?'1':'0').join('');const headers=fromAi?{'X-Chat-Control':'1','Content-Type':'application/x-www-form-urlencoded'}:{'Content-Type':'application/x-www-form-urlencoded'};try{const r=await fetch('/api/custom',{method:'POST',headers,body:'bitmap='+bitmap});if(!r.ok)throw 0;msg('pattern applied');return true;}catch(e){msg('apply failed');return false;}}"
     "function inferControlFromText(userText,assistantReply){const u=String(userText||'');const a=String(assistantReply||'');if(/苹果/.test(u)||/苹果/.test(a)){return {mode:'custom',color:'#FF2D2D',bitmap:APPLE_BITMAP};}if(/火焰|fire/i.test(u)||/火焰|fire/i.test(a)){return {mode:'fire'};}if(/流水|水流|water|fluid/i.test(u)||/流水|水流|water|fluid/i.test(a)){return {mode:'water'};}return null;}"
     "async function applyAiControl(control,userText){if(!control||typeof control!=='object'){return;}const requestedText=String(userText||'');const wantsColor=/(颜色|色彩|color|rgb|#)/i.test(requestedText);const hasBitmap=typeof control.bitmap==='string'&&control.bitmap.trim().length>0;if(control.mode){await setMode(String(control.mode).trim(),true);}else if(hasBitmap){await setMode('custom',true);}if(control.color&&(wantsColor||hasBitmap)){const rgb=hexColorToRgb(control.color);if(rgb){state.r8=clamp8(rgb.r);state.g8=clamp8(rgb.g);state.b8=clamp8(rgb.b);syncColorInputs();updatePreview();await applyColor(true);}}if(hasBitmap){const grid=bitmapToGrid(String(control.bitmap).trim());if(grid){state.grid=grid;makeGrid();await applyPattern(true);}else{appendChatBubble('system','AI位图无效，已忽略。');}}}"
-    "async function sendChat(){if(chatState.busy)return;const input=document.getElementById('chat-input');const apiKey=document.getElementById('chat-api-key').value.trim();const text=input.value.trim();if(!apiKey){msg('api key required');return;}if(!text){msg('message required');return;}try{localStorage.setItem(chatStorageKey,apiKey);}catch(e){}chatState.busy=true;document.getElementById('chat-send').disabled=true;input.disabled=true;document.getElementById('chat-save-key').disabled=true;chatState.messages.push({role:'user',content:text});pruneChatHistory();appendChatBubble('user',text);input.value='';msg('sending...');try{const payload={model:chatModel,messages:[{role:'system',content:chatSystemPrompt},...chatState.messages],thinking:{type:'enabled'},max_tokens:65536,temperature:1.0};const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json','X-Zhipu-Api-Key':apiKey},body:JSON.stringify(payload)});const raw=await r.text();if(!r.ok)throw new Error(raw||('HTTP '+r.status));const j=JSON.parse(raw);const answer=j&&j.choices&&j.choices[0]&&j.choices[0].message&&j.choices[0].message.content?String(j.choices[0].message.content):'';if(!answer)throw new Error('empty assistant response');const parsed=parseAssistantReply(answer);chatState.messages.push({role:'assistant',content:parsed.reply});pruneChatHistory();appendChatBubble('assistant',parsed.reply);const inferred=inferControlFromText(text,parsed.reply);const ctl=parsed.control||inferred;if(ctl){await applyAiControl(ctl,text);}msg('done');}catch(e){appendChatBubble('system','请求失败：'+(e&&e.message?e.message:'unknown'));msg('chat failed');}finally{chatState.busy=false;document.getElementById('chat-send').disabled=false;input.disabled=false;document.getElementById('chat-save-key').disabled=false;input.focus();}}"
-    "async function loadState(){try{const r=await fetch('/api/state');const j=await r.json();state.mode=j.mode||state.mode;if(j.r8!==undefined)state.r8=clamp8(j.r8);if(j.g8!==undefined)state.g8=clamp8(j.g8);if(j.b8!==undefined)state.b8=clamp8(j.b8);state.sta_connected=!!j.sta_connected;state.sta_ssid=j.sta_ssid||'';state.sta_ip=j.sta_ip||'';state.wifi_only=!!j.wifi_only;setModeBtn();syncColorInputs();updatePreview();updateWifiStatus();updateWifiOnlyUI();if(state.sta_ssid){document.getElementById('wifi-ssid').value=state.sta_ssid;}}catch(e){msg('state load failed');}}"
-    "async function setWifiOnly(on){const body='wifi_only='+(on?'1':'0');try{const r=await fetch('/api/wifi/only',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});if(!r.ok)throw 0;state.wifi_only=on;updateWifiOnlyUI();msg(on?'wifi only enabled':'wifi only disabled');setTimeout(loadState,500);}catch(e){msg('set wifi only failed');document.getElementById('wifi-only').checked=state.wifi_only;}}"
-    "async function connectWifi(){const ssid=document.getElementById('wifi-ssid').value.trim();const pass=document.getElementById('wifi-pass').value;const wifiOnly=document.getElementById('wifi-only').checked;if(!ssid){msg('ssid required');return;}const body='ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent(pass)+'&wifi_only='+(wifiOnly?'1':'0');try{const r=await fetch('/api/wifi/connect',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});if(!r.ok)throw 0;state.sta_ssid=ssid;state.sta_connected=false;state.sta_ip='';state.wifi_only=wifiOnly;updateWifiStatus();updateWifiOnlyUI();msg('wifi connecting...');setTimeout(loadState,2000);}catch(e){msg('connect failed');}}"
+    "async function sendChat(){if(chatState.busy)return;const input=document.getElementById('chat-input');const chatConfig=getChatConfig();const text=input.value.trim();if(!chatConfig.key){msg('api key required');return;}if(!chatConfig.url){msg('api url required');return;}if(!chatConfig.model){msg('model required');return;}if(!text){msg('message required');return;}persistChatConfig(chatConfig);chatState.busy=true;document.getElementById('chat-send').disabled=true;input.disabled=true;document.getElementById('chat-save-config').disabled=true;chatState.messages.push({role:'user',content:text});pruneChatHistory();appendChatBubble('user',text);input.value='';msg('sending...');try{const payload={model:chatConfig.model,messages:[{role:'system',content:chatSystemPrompt},...chatState.messages],thinking:{type:'enabled'},max_tokens:65536,temperature:1.0};const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json','X-Zhipu-Api-Key':chatConfig.key,'X-Chat-Api-Url':chatConfig.url,'X-Chat-Model':chatConfig.model},body:JSON.stringify(payload)});const raw=await r.text();if(!r.ok)throw new Error(raw||('HTTP '+r.status));const j=JSON.parse(raw);const answer=j&&j.choices&&j.choices[0]&&j.choices[0].message&&j.choices[0].message.content?String(j.choices[0].message.content):'';if(!answer)throw new Error('empty assistant response');const parsed=parseAssistantReply(answer);chatState.messages.push({role:'assistant',content:parsed.reply});pruneChatHistory();appendChatBubble('assistant',parsed.reply);const inferred=inferControlFromText(text,parsed.reply);const ctl=parsed.control||inferred;if(ctl){await applyAiControl(ctl,text);}msg('done');}catch(e){appendChatBubble('system','请求失败：'+(e&&e.message?e.message:'unknown'));msg('chat failed');}finally{chatState.busy=false;document.getElementById('chat-send').disabled=false;input.disabled=false;document.getElementById('chat-save-config').disabled=false;input.focus();}}"
+    "async function loadState(){try{const r=await fetch('/api/state');const j=await r.json();state.mode=j.mode||state.mode;if(j.r8!==undefined)state.r8=clamp8(j.r8);if(j.g8!==undefined)state.g8=clamp8(j.g8);if(j.b8!==undefined)state.b8=clamp8(j.b8);state.sta_connected=!!j.sta_connected;state.sta_ssid=j.sta_ssid||'';state.sta_ip=j.sta_ip||'';state.wifi_only=!!j.wifi_only;state.offline_mode=!!j.offline_mode;setModeBtn();syncColorInputs();updatePreview();updateWifiStatus();updateWifiOnlyUI();if(state.sta_ssid){document.getElementById('wifi-ssid').value=state.sta_ssid;}if(document.getElementById('wifi-offline')){document.getElementById('wifi-offline').checked=state.offline_mode;}if(!state.offline_mode&&state.sta_ssid&&!state.sta_connected&&wifiStateRetry<wifiStateRetryMax){wifiStateRetry++;setTimeout(loadState,1000);}else{wifiStateRetry=0;}}catch(e){msg('state load failed');}}"
+    "async function setWifiOnly(on){const body='wifi_only='+(on?'1':'0');try{const r=await fetch('/api/wifi/only',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});if(!r.ok)throw 0;state.wifi_only=on;wifiStateRetry=0;updateWifiOnlyUI();msg(on?'wifi only enabled':'wifi only disabled');setTimeout(loadState,300);}catch(e){msg('set wifi only failed');document.getElementById('wifi-only').checked=state.wifi_only;}}"
+    "async function setOfflineMode(on){const body='offline='+(on?'1':'0');try{const r=await fetch('/api/wifi/offline',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});if(!r.ok)throw 0;state.offline_mode=on;wifiStateRetry=0;msg(on?'offline mode enabled':'offline mode disabled');setTimeout(loadState,300);}catch(e){msg('set offline failed');if(document.getElementById('wifi-offline'))document.getElementById('wifi-offline').checked=state.offline_mode;}}"
+    "async function connectWifi(){const ssid=document.getElementById('wifi-ssid').value.trim();const pass=document.getElementById('wifi-pass').value;const wifiOnly=document.getElementById('wifi-only').checked;if(!ssid){msg('ssid required');return;}const body='ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent(pass)+'&wifi_only='+(wifiOnly?'1':'0');try{const r=await fetch('/api/wifi/connect',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});if(!r.ok)throw 0;state.sta_ssid=ssid;state.sta_connected=false;state.sta_ip='';state.wifi_only=wifiOnly;wifiStateRetry=0;updateWifiStatus();updateWifiOnlyUI();msg('wifi connecting...');setTimeout(loadState,1200);}catch(e){msg('connect failed');}}"
     "document.getElementById('mode-fire').onclick=()=>setMode('fire');"
     "document.getElementById('mode-water').onclick=()=>setMode('water');"
     "document.getElementById('mode-custom').onclick=()=>setMode('custom');"
     "document.getElementById('wifi-connect').onclick=connectWifi;"
     "document.getElementById('wifi-only').onchange=e=>setWifiOnly(!!e.target.checked);"
-    "document.getElementById('chat-save-key').onclick=saveChatKey;"
+    "if(document.getElementById('wifi-offline'))document.getElementById('wifi-offline').onchange=e=>setOfflineMode(!!e.target.checked);"
+    "document.getElementById('chat-save-config').onclick=saveChatConfig;"
+    "document.getElementById('chat-rst-config').onclick=resetChatConfig;"
     "document.getElementById('chat-clear').onclick=clearChat;"
     "document.getElementById('chat-send').onclick=sendChat;"
-    "document.getElementById('chat-api-key').addEventListener('change',saveChatKey);"
+    "document.getElementById('chat-api-url').addEventListener('input',updateChatMeta);"
+    "document.getElementById('chat-api-model').addEventListener('input',updateChatMeta);"
+    "document.getElementById('chat-api-key').addEventListener('change',saveChatConfig);"
     "document.getElementById('chat-input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat();}});"
     "document.getElementById('color-picker').addEventListener('input',()=>{readColorInputs();});"
     "document.getElementById('apply-color').onclick=applyColor;"
     "document.getElementById('apply').onclick=applyPattern;"
-    "makeGrid();syncColorInputs();updatePreview();updateWifiStatus();loadChatKey();initChatLog();loadState();"
+    "makeGrid();syncColorInputs();updatePreview();updateWifiStatus();loadChatConfig();initChatLog();loadState();"
     "</script></body></html>";
 
 static const char* mode_to_str(sim_mode_t mode) {
@@ -706,10 +750,11 @@ static esp_err_t state_get_handler(httpd_req_t* req) {
     uint8_t b8 = 0;
     rgb_get_global_color8(&r8, &g8, &b8);
     snprintf(resp, sizeof(resp),
-             "{\"mode\":\"%s\",\"r8\":%u,\"g8\":%u,\"b8\":%u,\"sta_connected\":%s,\"sta_ssid\":\"%s\",\"sta_ip\":\"%s\",\"wifi_only\":%s}",
+             "{\"mode\":\"%s\",\"r8\":%u,\"g8\":%u,\"b8\":%u,\"sta_connected\":%s,\"sta_ssid\":\"%s\",\"sta_ip\":\"%s\",\"wifi_only\":%s,\"offline_mode\":%s}",
              mode, (unsigned)r8, (unsigned)g8, (unsigned)b8,
              s_sta_connected ? "true" : "false", s_sta_ssid, s_sta_ip,
-             s_wifi_only_mode ? "true" : "false");
+             s_wifi_only_mode ? "true" : "false",
+             s_offline_mode ? "true" : "false");
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
@@ -965,6 +1010,8 @@ static esp_err_t wifi_connect_post_handler(httpd_req_t* req) {
     strlcpy(s_sta_pass, pass, sizeof(s_sta_pass));
     s_sta_connected = false;
     s_sta_ip[0] = '\0';
+    s_offline_mode = false;
+    save_offline_mode(false);
     apply_wifi_only_mode(wifi_only);
 
     httpd_resp_set_type(req, "application/json");
@@ -999,6 +1046,48 @@ static esp_err_t wifi_only_post_handler(httpd_req_t* req) {
     }
 
     apply_wifi_only_mode(wifi_only);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t wifi_offline_post_handler(httpd_req_t* req) {
+    char body[64] = {0};
+    int remain = req->content_len;
+    if (remain <= 0 || remain >= (int)sizeof(body)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body");
+        return ESP_OK;
+    }
+
+    int offset = 0;
+    while (remain > 0) {
+        int got = httpd_req_recv(req, body + offset, remain);
+        if (got <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "recv failed");
+            return ESP_OK;
+        }
+        remain -= got;
+        offset += got;
+    }
+    body[offset] = '\0';
+
+    bool offline = false;
+    if (!parse_form_bool(body, "offline", &offline)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing offline");
+        return ESP_OK;
+    }
+
+    s_offline_mode = offline;
+    save_offline_mode(offline);
+
+    if (offline) {
+        ESP_LOGI(TAG, "Offline mode enabled. Disconnecting STA.");
+        esp_wifi_disconnect();
+    } else if (s_sta_ssid[0] != '\0' && !s_sta_connected) {
+        ESP_LOGI(TAG, "Offline mode disabled. Reconnecting STA.");
+        esp_wifi_connect();
+    }
+
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
@@ -1077,12 +1166,19 @@ static esp_err_t start_softap(void) {
         saved_sta_cfg.sta.pmf_cfg.capable = true;
         saved_sta_cfg.sta.pmf_cfg.required = false;
 
-        if (esp_wifi_set_config(WIFI_IF_STA, &saved_sta_cfg) == ESP_OK && esp_wifi_connect() == ESP_OK) {
+        esp_wifi_set_config(WIFI_IF_STA, &saved_sta_cfg);
+        if (!s_offline_mode) {
+            if (esp_wifi_connect() == ESP_OK) {
+                strlcpy(s_sta_ssid, saved_ssid, sizeof(s_sta_ssid));
+                strlcpy(s_sta_pass, saved_pass, sizeof(s_sta_pass));
+                ESP_LOGI(TAG, "auto connect STA: %s", s_sta_ssid);
+            } else {
+                ESP_LOGW(TAG, "auto connect STA failed");
+            }
+        } else {
             strlcpy(s_sta_ssid, saved_ssid, sizeof(s_sta_ssid));
             strlcpy(s_sta_pass, saved_pass, sizeof(s_sta_pass));
-            ESP_LOGI(TAG, "auto connect STA: %s", s_sta_ssid);
-        } else {
-            ESP_LOGW(TAG, "auto connect STA failed");
+            ESP_LOGI(TAG, "STA auto connect skipped (Offline Mode enabled)");
         }
     } else {
         ESP_LOGI(TAG, "no saved STA credentials");
@@ -1098,7 +1194,7 @@ static esp_err_t start_http_server(void) {
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 16;
     config.stack_size = 16384;
 
     esp_err_t err = httpd_start(&s_server, &config);
@@ -1155,6 +1251,13 @@ static esp_err_t start_http_server(void) {
         .user_ctx = NULL,
     };
 
+    httpd_uri_t wifi_offline_uri = {
+        .uri = "/api/wifi/offline",
+        .method = HTTP_POST,
+        .handler = wifi_offline_post_handler,
+        .user_ctx = NULL,
+    };
+
     httpd_uri_t chat_uri = {
         .uri = "/api/chat",
         .method = HTTP_POST,
@@ -1169,6 +1272,7 @@ static esp_err_t start_http_server(void) {
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &color_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &wifi_connect_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &wifi_only_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &wifi_offline_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &chat_uri));
     return ESP_OK;
 }
